@@ -37,6 +37,7 @@ Wait until you see INFO [org.eclipse.jetty.server.Server]: Started in the termin
 
 Download and install Ollama.
 
+6. Pull the model:
 
         ollama pull llama3
 
@@ -46,7 +47,7 @@ Ensure Ollama is running (it usually sits in the system tray, or run ollama serv
 
 1. Run the Flask App:
 
-python app_3.py
+                python app_3.py
 
 2. Open your browser to: http://localhost:5000
 
