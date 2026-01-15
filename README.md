@@ -77,7 +77,6 @@ The results interface uses specific colors to indicate where a reference was fou
 | 💠 **Cyan** | **OpenLibrary** | Books verified via ISBN. |
 # Troubleshooting:
 
-Troubleshooting
 1. Grobid is hanging / timing out.
 
 Ensure you are using the -e "JAVA_OPTS=-Xmx4g" flag in your Docker command.
