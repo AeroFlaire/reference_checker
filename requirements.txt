@@ -1,0 +1,11 @@
+# Web Framework and Utilities
+Flask
+requests
+werkzeug
+
+# PDF Processing
+# Note: 'fitz' is imported from PyMuPDF
+PyMuPDF
+
+# XML/HTML Parsing (for Grobid output)
+lxml
