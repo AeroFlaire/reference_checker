@@ -17,7 +17,7 @@ import pdf_extractor
 # --- Configuration ---
 OLLAMA_MODEL = "llama3"
 OLLAMA_HOST = "http://localhost:11434"
-OPENALEX_EMAIL = "" #TODO: Make open_alex email and add here.
+OPENALEX_EMAIL = "arjo456@gmail.com" #TODO: Make open_alex email and add here.
 UPLOAD_FOLDER = 'uploads'
 ALLOWED_EXTENSIONS = {'pdf'}
 
