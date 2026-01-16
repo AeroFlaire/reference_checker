@@ -27,7 +27,7 @@ Ollama (Required for AI fallback)
 
         pip install -r requirements.txt
 
-4. Start the Grobid Server (Docker) - if you need to install Docker, go to this link https://www.docker.com/products/docker-desktop/:
+4. Start the Grobid Server by running this cmmand in your terminal (Docker) - if you need to install Docker, go to this link https://www.docker.com/products/docker-desktop/:
 
         docker run --rm --init -p 8070:8070 -e "JAVA_OPTS=-Xmx4g" lfoppiano/grobid:0.8.1
 
