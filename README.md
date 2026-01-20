@@ -46,7 +46,7 @@ Ensure Ollama is running (it usually sits in the system tray, or run ollama serv
 # Usage:
 
 
-1.Prior to running the flask app, you must add your email to the variable OPENALEX_EMAIL on line 20 of app_3.py.
+1. Prior to running the flask app, you must add your email to the variable OPENALEX_EMAIL on line 20 of app_3.py.
 
 2. Run the Flask App:
 
