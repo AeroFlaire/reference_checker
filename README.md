@@ -15,29 +15,27 @@ Ollama (Required for AI fallback)
 
 # Installation and Setup:
 
-1. Fork the repository.
-
-2. Clone the repository:
+1. Clone the repository (change yourusername to whatever your username is):
 
         git clone https://github.com/yourusername/reference_checker.git
 
         cd reference_checker.git
 
-3. Install Python Dependencies:
+2. Install Python Dependencies:
 
         pip install -r requirements.txt
 
-4. Start the Grobid Server (Docker):
+3. Start the Grobid Server (Docker):
 
         docker run --rm --init -p 8070:8070 -e "JAVA_OPTS=-Xmx4g" lfoppiano/grobid:0.8.1
 
 Wait until you see INFO [org.eclipse.jetty.server.Server]: Started in the terminal.
 
-5. Start Ollama:
+4. Start Ollama:
 
 Download and install Ollama.
 
-6. Pull the model:
+5. Pull the model:
 
         ollama pull llama3
 
@@ -45,15 +43,15 @@ Ensure Ollama is running (it usually sits in the system tray, or run ollama serv
 
 # Usage:
 
-## Note that prior to running the flask app, you must add your email to the variable OPENALEX_EMAIL on line 20 of app_3.py.
+1. Add your email to OPENALEX_EMAIL
 
-1. Run the Flask App:
+2. Run the Flask App:
 
                 python app_3.py
 
-2. Open your browser to: http://localhost:5000
+3. Open your browser to: http://localhost:5000
 
-3. Upload a PDF. The system will:
+4. Upload a PDF. The system will:
 
         Slice the PDF to find reference pages.
 
