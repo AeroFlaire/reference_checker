@@ -1,6 +1,6 @@
 # Explanation:
 
-This is a multi-stage citation valigator designed to vaerify academic references from PDF documents (as of now ACM). THis is designed to handell journals, technical standards, books, and grey literature. 
+This is a multi-stage citation valigator designed to vaerify academic references from PDF documents (as of now ACM). This is designed to handell journals, technical standards, books, and grey literature. 
 
 Verifies citations against: OpenAlex (Primary Academic DB), Crossref (DOI Backstop), Semantic Scholar (Grey Literature & Datasets), WG21 (C++ Standards Committee Papers), IETF (Internet RFCs), OpenLibrary (Books/ISBNs)
 
