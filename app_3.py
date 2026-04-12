@@ -24,6 +24,7 @@ ALLOWED_EXTENSIONS = {'pdf'}
 # --- THREADING CONFIG ---
 # 3-5 is safe. Higher might crash Ollama or get you blocked by OpenAlex.
 MAX_WORKERS = 5 
+BATCH_PDF_WORKERS = 2
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
@@ -751,6 +752,45 @@ def process_references_list(reference_strings):
         "not_reference": results_not_reference # <--- ADD THIS
     }
 
+def merge_result_sets(result_sets):
+    """Merge multiple process_references_list payloads into one aggregate payload."""
+    merged = {
+        "verified": [],
+        "edition_mismatch": [],
+        "flawed_reference": [],
+        "not_found": [],
+        "not_reference": []
+    }
+
+    for result in result_sets:
+        if not result:
+            continue
+        for key in merged.keys():
+            merged[key].extend(result.get(key, []))
+
+    return merged
+
+
+def process_pdf_file(filepath, filename):
+    """Extract and process references for a single PDF file."""
+    print(f"Extracting references from {filename}...")
+    references = pdf_extractor.extract_references(filepath)
+    print(f"Found {len(references)} references in {filename}. Checking them now (Parallel)...")
+    results = process_references_list(references)
+
+    counts = {key: len(results.get(key, [])) for key in [
+        "verified", "edition_mismatch", "flawed_reference", "not_found", "not_reference"
+    ]}
+
+    return {
+        "filename": filename,
+        "status": "done",
+        "reference_count": len(references),
+        "counts": counts,
+        "results": results
+    }
+
+
 # --- Routes ---
 
 @app.route('/')
@@ -769,7 +809,7 @@ def api_check_references():
 
 @app.route("/api/upload-pdf", methods=["POST"])
 def upload_pdf():
-    """New route for PDF uploads"""
+    """Route for a single PDF upload."""
     if 'file' not in request.files:
         return jsonify({"error": "No file part"}), 400
     
@@ -783,25 +823,85 @@ def upload_pdf():
         file.save(filepath)
         
         try:
-            # 1. Extract references using the separate module
-            print(f"Extracting references from {filename}...")
-            references = pdf_extractor.extract_references(filepath)
-            print(f"Found {len(references)} references. Checking them now (Parallel)...")
-            
-            # 2. Process them
-            results = process_references_list(references)
-            
-           # 3. Cleanup (optional)
-            if os.path.exists(filepath):
-                os.remove(filepath)
-            
-            return jsonify(results)
+            result = process_pdf_file(filepath, filename)
+            return jsonify(result["results"])
             
         except Exception as e:
             print(f"Error processing PDF: {e}")
             return jsonify({"error": str(e)}), 500
+        
+        finally:
+            if os.path.exists(filepath):
+                os.remove(filepath)
             
     return jsonify({"error": "Invalid file type"}), 400
+
+@app.route("/api/upload-pdfs", methods=["POST"])
+def upload_pdfs_batch():
+    """Route for batch PDF uploads."""
+    files = request.files.getlist('files')
+    if not files:
+        return jsonify({"error": "No files provided"}), 400
+
+    saved_files = []
+    for idx, file in enumerate(files):
+        if not file or file.filename == '':
+            continue
+        if not allowed_file(file.filename):
+            return jsonify({"error": f"Invalid file type: {file.filename}"}), 400
+
+        filename = secure_filename(file.filename)
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], f"{idx}_{filename}")
+        file.save(filepath)
+        saved_files.append((filepath, filename))
+
+    if not saved_files:
+        return jsonify({"error": "No valid files to process"}), 400
+
+    per_file_results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=BATCH_PDF_WORKERS) as executor:
+        futures = {
+            executor.submit(process_pdf_file, filepath, filename): (filepath, filename)
+            for filepath, filename in saved_files
+        }
+
+        for future in concurrent.futures.as_completed(futures):
+            filepath, filename = futures[future]
+            try:
+                per_file_results.append(future.result())
+            except Exception as e:
+                per_file_results.append({
+                    "filename": filename,
+                    "status": "error",
+                    "error": str(e),
+                    "results": {
+                        "verified": [],
+                        "edition_mismatch": [],
+                        "flawed_reference": [],
+                        "not_found": [],
+                        "not_reference": []
+                    }
+                })
+            finally:
+                if os.path.exists(filepath):
+                    os.remove(filepath)
+
+    aggregate = merge_result_sets([entry.get("results", {}) for entry in per_file_results if entry.get("status") == "done"])
+
+    summary = {
+        "total_files": len(per_file_results),
+        "completed": len([x for x in per_file_results if x.get("status") == "done"]),
+        "failed": len([x for x in per_file_results if x.get("status") == "error"])
+    }
+
+    return jsonify({
+        "mode": "batch",
+        "summary": summary,
+        "files": per_file_results,
+        "aggregate": aggregate,
+        # compatibility keys for existing frontend logic
+        **aggregate
+    })
 
 if __name__ == '__main__':
     # Threaded=True is important for Flask to handle requests while processing
