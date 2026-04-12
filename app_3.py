@@ -4,6 +4,7 @@ import requests
 import re
 import unicodedata 
 import difflib
+import copy
 import time
 from flask import Flask, jsonify, request, send_file, send_from_directory
 from werkzeug.utils import secure_filename
@@ -20,10 +21,11 @@ OLLAMA_HOST = "http://localhost:11434"
 OPENALEX_EMAIL = "" #TODO: Make open_alex email and add here.
 UPLOAD_FOLDER = 'uploads'
 ALLOWED_EXTENSIONS = {'pdf'}
+S2_API_KEY = "" #TODO: Obtain Semantic Scholar API key and add here.
 
 # --- THREADING CONFIG ---
 # 3-5 is safe. Higher might crash Ollama or get you blocked by OpenAlex.
-MAX_WORKERS = 5 
+MAX_WORKERS = 6
 BATCH_PDF_WORKERS = 2
 
 app = Flask(__name__)
@@ -228,6 +230,7 @@ def get_semantic_scholar_paper(paper_id):
     """
     url = f"https://api.semanticscholar.org/graph/v1/paper/{paper_id}"
     params = {"fields": "title,authors,year,url,externalIds"}
+    headers = {"x-api-key": S2_API_KEY} if S2_API_KEY else {}
     try:
         # Respect rate limits
         time.sleep(0.5) 
@@ -257,6 +260,8 @@ def search_semantic_scholar(query):
         "limit": 1,
         "fields": "title,authors,year,url,externalIds"
     }
+    headers = {"x-api-key": S2_API_KEY} if S2_API_KEY else {}
+
     
     try:
         # 1 second sleep to respect free tier rate limits (100 req/5min)
