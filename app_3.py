@@ -18,10 +18,10 @@ import pdf_extractor
 # --- Configuration ---
 OLLAMA_MODEL = "llama3"
 OLLAMA_HOST = "http://localhost:11434"
-OPENALEX_EMAIL = "" #TODO: Make open_alex email and add here.
+OPENALEX_EMAIL = "arjo456@gmail.com" #TODO: Make open_alex email and add here.
 UPLOAD_FOLDER = 'uploads'
 ALLOWED_EXTENSIONS = {'pdf'}
-S2_API_KEY = "" #TODO: Obtain Semantic Scholar API key and add here.
+S2_API_KEY = "g24qmH5WI25wTKLHJJH1SDYkP3rkkpz8AtccLrVi" #TODO: Obtain Semantic Scholar API key and add here.
 
 # --- THREADING CONFIG ---
 # 3-5 is safe. Higher might crash Ollama or get you blocked by OpenAlex.
@@ -543,29 +543,79 @@ def check_single_reference(ref_data):
                         best_flawed = match
         
         return status, best_match, best_flawed
+    
+
+    def run_method_pipeline(parsed_title, parsed_author, parsed_year, source):
+        """
+        Runs OpenAlex -> Crossref -> Semantic Scholar for one parser source.
+        If any method returns VERIFIED / YEAR_MISMATCH / FLAWED_REFERENCE,
+        stop immediately and do not continue to the next method.
+        """
+        payload = {
+            "original_reference": ref_string, 
+            "parsed_query": {"title": parsed_title, "source": source}
+        }
+
+        # Method 1: OpenAlex
+        status, match, flawed = perform_search_and_verify(parsed_title, parsed_author, parsed_year)
+        if status == "VERIFIED":
+            payload["openalex_match"] = match
+            return {"status": "VERIFIED", "payload": payload}
+        if status == "YEAR_MISMATCH":
+            payload["openalex_match (edition mismatch)"] = match
+            return {"status": "YEAR_MISMATCH", "payload": payload}
+        if status == "FLAWED_REFERENCE":
+            payload["openalex_match (mismatched)"] = flawed
+            return {"status": "FLAWED_REFERENCE", "payload": payload}
+
+        # Method 2: Crossref
+        crossref_query = f"{parsed_title} {parsed_author}"
+        if len(crossref_query) > 10:
+            raw_crossref = search_crossref(crossref_query)
+            if raw_crossref:
+                cr_title = raw_crossref.get("title", [""])[0]
+                cr_year = None
+                try:
+                    cr_year = raw_crossref.get("published", {}).get("date-parts", [[None]])[0][0]
+                except: pass
+
+                score = levenshtein_similarity(parsed_title, cr_title)
+                if score > 95:
+                    formatted_match = {
+                        "display_name": cr_title,
+                        "publication_year": cr_year,
+                        "id": raw_crossref.get("URL", "No URL"),
+                        "note": "Found via Crossref (Backstop)"
+                    }
+                    payload["openalex_match"] = formatted_match
+                    return {"status": "VERIFIED", "payload": payload}
+
+        # Method 3: Semantic Scholar
+        s2_query = f"{parsed_title} {parsed_author}"
+        if len(s2_query) < 15:
+            s2_query = ref_string[:200]
+        s2_match = search_semantic_scholar(s2_query)
+        if s2_match:
+            s2_title = normalize_text(s2_match["display_name"])
+            score = levenshtein_similarity(parsed_title, s2_title)
+            title_in_ref = s2_title.lower() in ref_string.lower()
+            if score > 95 or title_in_ref:
+                payload["openalex_match"] = s2_match
+                return {"status": "VERIFIED", "payload": payload}
+
+        return {"status": "NOT_FOUND", "payload": payload}
 
     # =========================================================
     # PHASE 2: ATTEMPT 1 - GROBID (Fast Lane)
     # =========================================================
-    
-    # We only try this if Grobid actually found a title
+
     if g_title and len(g_title) > 5:
-        status, match, flawed = perform_search_and_verify(g_title, g_author, g_year)
-        
-        # IF IT WORKED -> RETURN IMMEDIATELY (Speed Win!)
-        if status == "VERIFIED":
-            payload = {
-                "original_reference": ref_string,
-                "parsed_query": {"title": g_title, "source": "GROBID"},
-                "openalex_match": match
-            }
-            return {"status": "VERIFIED", "payload": payload}
-        
-        # If it failed, we just silently fall through to PHASE 3...
-        # (We don't return "NOT_FOUND" yet, we give Ollama a chance)
+        grobid_result = run_method_pipeline(g_title, g_author, g_year, "GROBID")
+        if grobid_result["status"] in {"VERIFIED", "YEAR_MISMATCH", "FLAWED_REFERENCE"}:
+            return grobid_result
 
     # =========================================================
-    # PHASE 3: ATTEMPT 2 - OLLAMA (The Backup / High Quality)
+    # PHASE 3: ATTEMPT 2 - OLLAMA (Last Resort)
     # =========================================================
     
     lower_ref = ref_string.lower()
@@ -574,117 +624,28 @@ def check_single_reference(ref_data):
     try:
         prompt = parsing_prompt_template.format(reference_string=ref_string)
         parsed_data = call_ollama(prompt, "json")
-        
         parsed_title = str(parsed_data.get("title", ""))
         parsed_author = str(parsed_data.get("author", ""))
         parsed_year = parsed_data.get("year")
-        
-        # Fix List outputs from Ollama
         if isinstance(parsed_title, list): parsed_title = " ".join(map(str, parsed_title))
         if isinstance(parsed_author, list): parsed_author = " ".join(map(str, parsed_author))
-        
-        # Run search logic again with Ollama data
-        status, match, flawed = perform_search_and_verify(parsed_title, parsed_author, parsed_year)
-        
-        payload = {
-            "original_reference": ref_string, 
-            "parsed_query": {"title": parsed_title, "source": "OLLAMA"}
-        }
-        
-        if status == "VERIFIED":
-            payload["openalex_match"] = match
-            return {"status": "VERIFIED", "payload": payload}
-        elif status == "YEAR_MISMATCH":
-            payload["openalex_match (edition mismatch)"] = match
-            return {"status": "YEAR_MISMATCH", "payload": payload}
-        elif status == "FLAWED_REFERENCE":
-            payload["openalex_match (mismatched)"] = flawed
-            return {"status": "FLAWED_REFERENCE", "payload": payload}
-        else:
-            # =========================================================
-            # PHASE 3.5: THE FINAL BACKSTOP (Crossref)
-            # =========================================================
-            # If OpenAlex failed, let's ask Crossref one last time.
-            crossref_match = None
-            
-            # Construct a clean query string
-            crossref_query = f"{parsed_title} {parsed_author}"
-            
-            # Don't search if the query is empty/garbage
-            if len(crossref_query) > 10:
-                raw_crossref = search_crossref(crossref_query)
-                
-                if raw_crossref:
-                    # Check if the Crossref title matches reasonably well
-                    cr_title = raw_crossref.get("title", [""])[0]
-                    cr_year = None
-                    try:
-                        cr_year = raw_crossref.get("published", {}).get("date-parts", [[None]])[0][0]
-                    except: pass
+        ollama_result = run_method_pipeline(parsed_title, parsed_author, parsed_year, "OLLAMA")
+        if ollama_result["status"] in {"VERIFIED", "YEAR_MISMATCH", "FLAWED_REFERENCE"}:
+            return ollama_result
 
-                    # Simple validation (Score > 70)
-                    score = levenshtein_similarity(parsed_title, cr_title)
-                    
-                    if score > 95:
-                        # Convert Crossref format to match your OpenAlex format for the frontend
-                        formatted_match = {
-                            "display_name": cr_title,
-                            "publication_year": cr_year,
-                            "id": raw_crossref.get("URL", "No URL"),
-                            "note": "Found via Crossref (Backstop)"
-                        }
-                        
-                        payload["openalex_match"] = formatted_match
-                        return {"status": "VERIFIED", "payload": payload}
-                    
-        # =========================================================
-        # PHASE 4: SEMANTIC SCHOLAR (Datasets & Grey Lit)
-        # =========================================================
-            # 1. Try S2 with the Title + Author (Specific)
-            s2_query = f"{parsed_title} {parsed_author}"
-            
-            # 2. If that's too short, try the raw clean ref (Fuzzy)
-            if len(s2_query) < 15:
-                s2_query = ref_string[:200] # Limit length for API
-            
-            s2_match = search_semantic_scholar(s2_query)
-            
-            if s2_match:
-                # Calculate score to ensure it's not a hallucination
-                s2_title = normalize_text(s2_match["display_name"])
-                score = levenshtein_similarity(parsed_title, s2_title)
-                
-                # S2 is good, so we trust it with a lower threshold (e.g., 70)
-                # OR if the original ref contains the S2 title (good for datasets)
-                title_in_ref = s2_title.lower() in ref_string.lower()
-                
-                if score > 95 or title_in_ref:
-                    payload["openalex_match"] = s2_match
-                    return {"status": "VERIFIED", "payload": payload}
-
-            # If Crossref also fails, THEN return NOT_FOUND
-
-            # =========================================================
-            # PHASE 6: FINAL SUSPICION CHECK
-            # =========================================================
-            
-            # If we are here, we found NO match in any database.
-            # Now we check if the extractor thought this looked like garbage.
-            is_suspicious = False
-            if isinstance(ref_data, dict):
-                is_suspicious = ref_data.get("is_suspicious", False)
-
-            if is_suspicious:
-                # It failed all DB checks AND looks like noise -> It is likely not a reference.
-                return {
-                    "status": "NOT_REFERENCE", 
-                    "payload": {
-                        "original_reference": ref_string, 
-                        "note": "Ignored: Unstructured text with no database matches"
-                    }
+          # Final suspicion check if all methods failed
+        is_suspicious = False
+        if isinstance(ref_data, dict):
+            is_suspicious = ref_data.get("is_suspicious", False)
+        if is_suspicious:
+            return {
+                "status": "NOT_REFERENCE",
+                "payload": {
+                    "original_reference": ref_string,
+                    "note": "Ignored: Unstructured text with no database matches"
                 }
-
-            return {"status": "NOT_FOUND", "payload": payload}
+            }
+        return ollama_result
 
     except Exception as e:
         # <--- CHANGED: Return NOT_REFERENCE if parsing fails critically, or keep as NOT_FOUND with error
