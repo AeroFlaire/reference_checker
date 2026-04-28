@@ -54,7 +54,7 @@ Ensure Ollama is running (it usually sits in the system tray, or run ollama serv
 
 3. Open your browser to: http://localhost:5000
 
-4. Upload a PDF. The system will:
+4. Upload PDF(s). The system will:
 
         Slice the PDF to find reference pages.
 
