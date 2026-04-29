@@ -98,6 +98,28 @@ def levenshtein_similarity(s1, s2):
     max_len = max(len(s1), len(s2))
     return int((1 - distance / max_len) * 100)
 
+def tokenize_for_similarity(text):
+    if not text:
+        return set()
+    text = normalize_text(text).lower()
+    text = re.sub(r'[^a-z0-9\s]', ' ', text)
+    tokens = [t for t in text.split() if len(t) > 2]
+    stop = {"the", "and", "for", "with", "from", "that", "this", "using", "toward", "towards", "proceedings"}
+    return {t for t in tokens if t not in stop}
+
+def hybrid_title_similarity(a, b):
+    """
+    More robust than raw Levenshtein for OCR/parsing noise:
+    blend character similarity + token overlap.
+    """
+    lev = levenshtein_similarity(a, b)
+    ta, tb = tokenize_for_similarity(a), tokenize_for_similarity(b)
+    if not ta or not tb:
+        return lev
+    overlap = len(ta & tb) / max(1, len(ta | tb))
+    token_score = int(overlap * 100)
+    return int(0.6 * lev + 0.4 * token_score)
+
 def search_openalex(title=None, author=None, year=None, general_search=None):
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36'}
     base_url = "https://api.openalex.org/works"
@@ -114,7 +136,8 @@ def search_openalex(title=None, author=None, year=None, general_search=None):
         params["filter"] = ",".join(filters)
 
     try:
-        response = requests.get(base_url, params=params, headers=headers)
+        params["per-page"] = 25
+        response = requests.get(base_url, params=params, headers=headers, timeout=10)
         response.raise_for_status()
         return response.json().get("results", [])
     except:
@@ -128,7 +151,7 @@ def search_crossref(query):
     base_url = "https://api.crossref.org/works"
     params = {
         "query.bibliographic": query,
-        "rows": 1,
+        "rows": 10,
         "mailto": OPENALEX_EMAIL # Reuse your email here
     }
     
@@ -138,7 +161,7 @@ def search_crossref(query):
             data = resp.json()
             items = data.get("message", {}).get("items", [])
             if items:
-                return items[0] # Return the top match
+                return items # Return the top match
     except Exception as e:
         print(f"Crossref Error: {e}")
     return None
@@ -309,7 +332,7 @@ def check_single_reference(ref_data):
         g_year = ref_data.get("grobid_year")
 
     # Define Regex/Prompts
-    doi_regex = re.compile(r'\b(10\.\d{4,9}/[-._;()/:a-zA-Z0-9]+)\b')
+    doi_regex = re.compile(r'(?:doi\s*[:]\s*|https?://(?:dx\.)?doi\.org/)?(10\.\d{4,9}/[-._;()/:a-zA-Z0-9]+)', re.IGNORECASE)
     arxiv_regex = re.compile(r'arxiv\s*[:\s]\s*(\d{4}\.\d{4,5})', re.IGNORECASE)
     garbage_phrases = ["we propose", "in this paper", "section 3", "section 4"]
 
@@ -497,7 +520,7 @@ def check_single_reference(ref_data):
                 found_year = match.get("publication_year")
                 
                 # Title Check
-                score = levenshtein_similarity(parsed_title, found_title)                                
+                score = hybrid_title_similarity(parsed_title, found_title)                                
                 # --- RESCUE LOGIC: Check for Substring Match (Fixes Title+Author mash) ---
                 if score < 85: # If not a perfect match, check deeper
                     # Normalize both to simple alphanumeric strings
@@ -510,7 +533,7 @@ def check_single_reference(ref_data):
                         match["note"] = "Substring Match (Title merged with Authors)"
                 # -------------------------------------------------------------------------
                 
-                if score < 60: continue
+                if score < 55: continue
                 # Calculate Year Gap
                 year_gap = 999
                 if parsed_year and found_year:
@@ -537,7 +560,7 @@ def check_single_reference(ref_data):
                             best_match = match
                             
                 # 2. Flawed Match 
-                elif score >= 75 and status != "VERIFIED" and status != "YEAR_MISMATCH":
+                elif score >= 72 and status != "VERIFIED" and status != "YEAR_MISMATCH":
                     if status == "NOT_FOUND":
                         status = "FLAWED_REFERENCE"
                         best_flawed = match
@@ -570,25 +593,26 @@ def check_single_reference(ref_data):
 
         # Method 2: Crossref
         crossref_query = f"{parsed_title} {parsed_author}"
-        if len(crossref_query) > 10:
-            raw_crossref = search_crossref(crossref_query)
-            if raw_crossref:
-                cr_title = raw_crossref.get("title", [""])[0]
-                cr_year = None
-                try:
-                    cr_year = raw_crossref.get("published", {}).get("date-parts", [[None]])[0][0]
-                except: pass
+        if len(crossref_query) > 5:
+            raw_crossref_items = search_crossref(crossref_query)
+            if raw_crossref_items:
+                for raw_crossref in raw_crossref_items:
+                    cr_title = raw_crossref.get("title", [""])[0]
+                    cr_year = None
+                    try:
+                        cr_year = raw_crossref.get("published", {}).get("date-parts", [[None]])[0][0]
+                    except: pass
 
-                score = levenshtein_similarity(parsed_title, cr_title)
-                if score > 95:
-                    formatted_match = {
-                        "display_name": cr_title,
-                        "publication_year": cr_year,
-                        "id": raw_crossref.get("URL", "No URL"),
-                        "note": "Found via Crossref (Backstop)"
-                    }
-                    payload["openalex_match"] = formatted_match
-                    return {"status": "VERIFIED", "payload": payload}
+                    score = hybrid_title_similarity(parsed_title, cr_title)
+                    if score >= 90:
+                        formatted_match = {
+                            "display_name": cr_title,
+                            "publication_year": cr_year,
+                            "id": raw_crossref.get("URL", "No URL"),
+                            "note": "Found via Crossref (Backstop)"
+                        }
+                        payload["openalex_match"] = formatted_match
+                        return {"status": "VERIFIED", "payload": payload}
 
         # Method 3: Semantic Scholar
         s2_query = f"{parsed_title} {parsed_author}"
