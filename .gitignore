@@ -1,7 +1,15 @@
+uploads/
+jobs.db
+old_files
+
+
 # ---- Secrets ----
 .env
 .env.local
 *.env.local
+.claude
+working/
+working
 
 # ---- Runtime data (cache DBs, uploaded PDFs, batch results) ----
 # Keep the directory structure but ignore its contents.
@@ -18,7 +26,7 @@ data/pdfs/*
 *_digest.pdf
 
 # ---- Python ----
-__pycache__/
+__pycache__
 *.py[cod]
 *$py.class
 *.so
