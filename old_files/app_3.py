@@ -18,10 +18,10 @@ import pdf_extractor
 # --- Configuration ---
 OLLAMA_MODEL = "llama3"
 OLLAMA_HOST = "http://localhost:11434"
-OPENALEX_EMAIL = "" #TODO: Make open_alex email and add here.
+OPENALEX_EMAIL = "arjo456@gmail.com" #TODO: Make open_alex email and add here.
 UPLOAD_FOLDER = 'uploads'
 ALLOWED_EXTENSIONS = {'pdf'}
-S2_API_KEY = "" #TODO: Obtain Semantic Scholar API key and add here.
+S2_API_KEY = "g24qmH5WI25wTKLHJJH1SDYkP3rkkpz8AtccLrVi" #TODO: Obtain Semantic Scholar API key and add here.
 
 # --- THREADING CONFIG ---
 # 3-5 is safe. Higher might crash Ollama or get you blocked by OpenAlex.

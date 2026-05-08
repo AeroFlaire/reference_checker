@@ -1,0 +1,48 @@
+services:
+  grobid:
+    image: lfoppiano/grobid:0.8.1
+    container_name: refchecker-grobid
+    ports:
+      - "8070:8070"
+    environment:
+      # If you have plenty of RAM, bump to -Xmx6g for faster processing.
+      # If Docker Desktop is memory-constrained (<6GB), drop to -Xmx2g.
+      - JAVA_OPTS=-Xmx4g
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8070/api/isalive || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      # GROBID needs ~60-180s on first start to load ML models. Be generous.
+      start_period: 240s
+    restart: unless-stopped
+
+  app:
+    build: .
+    container_name: refchecker-app
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env
+    environment:
+      - GROBID_HOST=http://grobid:8070
+    volumes:
+      - ./data:/data
+    depends_on:
+      grobid:
+        # service_started (not service_healthy) — the app has its own retry
+        # loop for GROBID, so even if GROBID is slow to load, compose won't
+        # tear everything down. If GROBID never comes up, /api/health will
+        # report grobid_reachable: false so you can diagnose directly.
+        condition: service_started
+    restart: unless-stopped
+
+  # Optional: uncomment to also bring up Ollama. Most users won't need this.
+  # ollama:
+  #   image: ollama/ollama
+  #   container_name: refchecker-ollama
+  #   ports:
+  #     - "11434:11434"
+  #   volumes:
+  #     - ./data/ollama:/root/.ollama
+  #   restart: unless-stopped

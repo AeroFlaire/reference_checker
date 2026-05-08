@@ -1,11 +1,6 @@
-# Web Framework and Utilities
-Flask
-requests
-werkzeug
-
-# PDF Processing
-# Note: 'fitz' is imported from PyMuPDF
-PyMuPDF
-
-# XML/HTML Parsing (for Grobid output)
-lxml
+Flask>=2.3
+requests>=2.28
+werkzeug>=2.3
+PyMuPDF>=1.23
+lxml>=4.9
+rapidfuzz>=3.5

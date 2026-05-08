@@ -1,3 +1,56 @@
 uploads/
 _pycache_/
 jobs.db
+
+# ---- Secrets ----
+.env
+.env.local
+*.env.local
+
+# ---- Runtime data (cache DBs, uploaded PDFs, batch results) ----
+# Keep the directory structure but ignore its contents.
+data/cache/*
+data/uploads/*
+data/results/*
+data/pdfs/*
+!data/cache/.gitkeep
+!data/uploads/.gitkeep
+!data/results/.gitkeep
+!data/pdfs/.gitkeep
+
+# Stray digest PDFs the page-pruner may leave behind
+*_digest.pdf
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual envs
+.venv/
+venv/
+env/
+ENV/
+
+# ---- IDE / editor ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+desktop.ini

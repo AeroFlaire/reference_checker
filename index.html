@@ -54,11 +54,76 @@
         /* Custom scrollbar for the tabs to make it invisible but scrollable */
         .hide-scroll::-webkit-scrollbar { display: none; }
         .hide-scroll { -ms-overflow-style: none; scrollbar-width: none; }
+
+        /* Sidebar file-button styling */
+        .sidebar-file {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 0.5rem;
+            width: 100%;
+            text-align: left;
+            padding: 0.6rem 0.75rem;
+            margin-bottom: 0.25rem;
+            border-radius: 0.5rem;
+            border: 1px solid transparent;
+            background: rgba(30, 41, 59, 0.4);
+            color: #cbd5e1;
+            font-size: 0.875rem;
+            transition: all 0.15s ease;
+            cursor: pointer;
+        }
+        .sidebar-file:hover {
+            background: rgba(51, 65, 85, 0.6);
+            color: #fff;
+        }
+        .sidebar-file.active {
+            background: rgba(99, 102, 241, 0.18);
+            color: #fff;
+            border-color: rgba(99, 102, 241, 0.5);
+            box-shadow: 0 4px 12px -2px rgba(99, 102, 241, 0.25);
+        }
+        .sidebar-file .filename {
+            flex: 1;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .sidebar-file .badge {
+            flex-shrink: 0;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.7rem;
+            font-weight: 700;
+            padding: 0.15rem 0.45rem;
+            border-radius: 9999px;
+        }
+        .badge-issues-high { background: rgba(239, 68, 68, 0.18); color: #fca5a5; }
+        .badge-issues-low  { background: rgba(245, 158, 11, 0.18); color: #fcd34d; }
+        .badge-clean       { background: rgba(16, 185, 129, 0.15); color: #6ee7b7; }
+
+        .sidebar-group-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0.5rem 0.5rem 0.4rem;
+            margin-top: 0.75rem;
+            font-size: 0.7rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: #94a3b8;
+            cursor: pointer;
+            user-select: none;
+        }
+        .sidebar-group-header:hover { color: #e2e8f0; }
+        .sidebar-group-header .chevron { transition: transform 0.2s ease; }
+        .sidebar-group-header.collapsed .chevron { transform: rotate(-90deg); }
     </style>
 </head>
 <body class="min-h-screen flex flex-col items-center py-12 px-4 sm:px-6 lg:px-8">
 
-    <div class="w-full max-w-5xl">
+    <div class="w-full max-w-7xl">
         
         <div class="text-center mb-12 animate-fade-in">
             <div class="inline-flex items-center justify-center p-3 bg-blue-500/10 rounded-2xl mb-4 border border-blue-500/20">
@@ -112,6 +177,28 @@
                 <div id="file-tabs" class="flex gap-3 overflow-x-auto pb-2 hide-scroll">
                     </div>
             </div>
+
+            <!-- 2-column layout: file sidebar on the left (batch mode only),
+                 result accordion stack on the right. The right column flexes
+                 to fill available space when the sidebar is hidden. -->
+            <div class="flex flex-col md:flex-row gap-6">
+
+                <aside id="file-sidebar" class="hidden md:w-80 flex-shrink-0 md:sticky md:top-6 md:self-start md:max-h-[calc(100vh-3rem)] md:overflow-y-auto">
+                    <div class="glass-card rounded-2xl p-4">
+                        <div class="flex items-center justify-between mb-1">
+                            <h3 class="text-sm font-semibold text-white tracking-wide">Files</h3>
+                            <span id="sidebar-file-count" class="font-mono text-xs text-slate-500"></span>
+                        </div>
+                        <p class="text-[11px] text-slate-500 mb-3 leading-snug">Sorted by issues (not&nbsp;found, flagged, or edition mismatches).</p>
+                        <input type="text"
+                               id="sidebar-filter"
+                               placeholder="Filter filenames..."
+                               class="w-full mb-3 px-3 py-1.5 text-xs bg-slate-900/60 border border-slate-700 rounded-md text-slate-200 placeholder-slate-500 focus:outline-none focus:border-indigo-500" />
+                        <div id="sidebar-file-list"></div>
+                    </div>
+                </aside>
+
+                <main id="results-main" class="flex-1 min-w-0 space-y-6">
             
             <div class="glass-card rounded-2xl overflow-hidden transition-all duration-300 hover:border-emerald-500/30">
                 <div onclick="toggleSection('list-verified')" class="bg-slate-800/40 p-5 flex justify-between items-center cursor-pointer hover:bg-slate-800/60 transition group">
@@ -181,6 +268,9 @@
                     <i id="icon-list-ignored" class="fas fa-chevron-down rotate-icon text-slate-500 group-hover:text-white"></i>
                 </div>
                 <div id="list-ignored" class="p-5 space-y-5 hidden bg-slate-900/50"></div>
+            </div>
+
+                </main>
             </div>
 
             <div class="pt-6">
@@ -270,11 +360,12 @@
             const batchSummary = document.getElementById('batch-summary');
             const tabsContainer = document.getElementById('file-tabs-container');
             const tabsDiv = document.getElementById('file-tabs');
+            const fileSidebar = document.getElementById('file-sidebar');
 
             if (data.mode === 'batch' && data.summary) {
                 // We have multiple files!
                 batchDataFiles = data.files;
-                
+
                 // Show summary block
                 batchSummary.classList.remove('hidden');
                 batchSummary.innerHTML = `
@@ -296,44 +387,174 @@
                     </div>
                 `;
 
-                // Build the File Tabs
-                tabsContainer.classList.remove('hidden');
-                tabsDiv.innerHTML = '';
-                
-                batchDataFiles.forEach((fileObj, index) => {
-                    if(fileObj.status !== "done") return; // Skip failed ones
-                    
-                    const btn = document.createElement('button');
-                    btn.className = `file-tab whitespace-nowrap px-4 py-2 rounded-lg font-medium text-sm transition-all border ${index === 0 ? 'bg-indigo-500 text-white border-indigo-400 shadow-lg shadow-indigo-500/20' : 'bg-slate-800/60 text-slate-400 border-slate-700 hover:bg-slate-700 hover:text-white'}`;
-                    btn.innerHTML = `<i class="fas fa-file-pdf mr-2 opacity-70"></i>${fileObj.filename}`;
-                    btn.onclick = () => selectFile(index, btn);
-                    tabsDiv.appendChild(btn);
-                });
+                // Hide the legacy horizontal-tab container; we use the sidebar instead.
+                tabsContainer.classList.add('hidden');
+                fileSidebar.classList.remove('hidden');
+                renderSidebar();
 
-                // Render the first file by default
-                if(batchDataFiles.length > 0) {
-                    renderFileResults(batchDataFiles[0].results);
+                // Render the highest-issue file first (top of the list).
+                if (sidebarOrder.length > 0) {
+                    selectFileByIndex(sidebarOrder[0].index);
                 }
 
             } else {
-                // Single File Mode (No tabs)
+                // Single File Mode (No tabs, no sidebar)
                 batchSummary.classList.add('hidden');
                 tabsContainer.classList.add('hidden');
+                fileSidebar.classList.add('hidden');
                 renderFileResults(data);
             }
         }
 
-        // Logic to handle switching between files
-        function selectFile(index, clickedBtn) {
-            // Update button styles
-            document.querySelectorAll('.file-tab').forEach(btn => {
-                btn.className = 'file-tab whitespace-nowrap px-4 py-2 rounded-lg font-medium text-sm transition-all border bg-slate-800/60 text-slate-400 border-slate-700 hover:bg-slate-700 hover:text-white';
-            });
-            clickedBtn.className = 'file-tab whitespace-nowrap px-4 py-2 rounded-lg font-medium text-sm transition-all border bg-indigo-500 text-white border-indigo-400 shadow-lg shadow-indigo-500/20';
+        // ---------------------------------------------------------------
+        //  File-sidebar logic: compute issue counts, sort, group, render.
+        // ---------------------------------------------------------------
 
-            // Render the specific file's results
+        let sidebarOrder = []; // array of { index, filename, counts, total }
+        let sidebarFilter = "";
+        let sidebarCollapsed = { needs: false, clean: true };
+
+        function fileIssueStats(fileObj) {
+            const r = fileObj.results || {};
+            const not_found = (r.not_found || []).length;
+            const not_ref   = (r.not_reference || []).length;
+            const flawed    = (r.flawed_reference || []).length;
+            const edition   = (r.edition_mismatch || []).length;
+            const verified  = (r.verified || []).length;
+            return {
+                not_found, not_ref, flawed, edition, verified,
+                // "issues" = anything an editor needs to look at.
+                issues: not_found + not_ref + flawed + edition,
+                total:  not_found + not_ref + flawed + edition + verified,
+            };
+        }
+
+        function renderSidebar() {
+            // Build sort order: by issue count desc, then filename asc.
+            sidebarOrder = batchDataFiles
+                .map((f, i) => ({
+                    index: i,
+                    filename: f.filename,
+                    status: f.status,
+                    counts: fileIssueStats(f),
+                }))
+                .filter(x => x.status === 'done')
+                .sort((a, b) => (b.counts.issues - a.counts.issues) || a.filename.localeCompare(b.filename));
+
+            const total = sidebarOrder.length;
+            const withIssues = sidebarOrder.filter(x => x.counts.issues > 0);
+            const clean      = sidebarOrder.filter(x => x.counts.issues === 0);
+
+            document.getElementById('sidebar-file-count').textContent = `${total} file${total === 1 ? '' : 's'}`;
+
+            const list = document.getElementById('sidebar-file-list');
+            list.innerHTML = '';
+
+            const filter = sidebarFilter.trim().toLowerCase();
+            const matches = (f) => !filter || f.filename.toLowerCase().includes(filter);
+
+            // Group: Needs Review
+            if (withIssues.length > 0) {
+                list.appendChild(buildGroup({
+                    key: 'needs',
+                    title: 'Needs review',
+                    icon: '<i class="fas fa-circle-exclamation text-red-400 mr-2"></i>',
+                    files: withIssues.filter(matches),
+                    totalCount: withIssues.length,
+                }));
+            }
+
+            // Group: Clean
+            if (clean.length > 0) {
+                list.appendChild(buildGroup({
+                    key: 'clean',
+                    title: 'Clean',
+                    icon: '<i class="fas fa-circle-check text-emerald-400 mr-2"></i>',
+                    files: clean.filter(matches),
+                    totalCount: clean.length,
+                }));
+            }
+
+            if (withIssues.length === 0 && clean.length === 0) {
+                list.innerHTML = '<p class="text-xs text-slate-500 px-2 py-3">No completed files yet.</p>';
+            }
+        }
+
+        function buildGroup({ key, title, icon, files, totalCount }) {
+            const wrap = document.createElement('div');
+
+            const header = document.createElement('div');
+            header.className = 'sidebar-group-header' + (sidebarCollapsed[key] ? ' collapsed' : '');
+            header.innerHTML = `
+                <span>${icon}${title} <span class="font-mono text-slate-500 ml-1">${totalCount}</span></span>
+                <i class="fas fa-chevron-down chevron text-[10px]"></i>
+            `;
+            header.addEventListener('click', () => {
+                sidebarCollapsed[key] = !sidebarCollapsed[key];
+                renderSidebar();
+            });
+            wrap.appendChild(header);
+
+            if (!sidebarCollapsed[key]) {
+                const body = document.createElement('div');
+                files.forEach(f => body.appendChild(buildFileButton(f)));
+                if (files.length === 0) {
+                    body.innerHTML = '<p class="text-[11px] text-slate-600 px-2 py-1">No files match filter.</p>';
+                }
+                wrap.appendChild(body);
+            }
+            return wrap;
+        }
+
+        function buildFileButton(fileEntry) {
+            const btn = document.createElement('button');
+            btn.className = 'sidebar-file file-tab';
+            btn.dataset.fileIndex = fileEntry.index;
+
+            const issues = fileEntry.counts.issues;
+            let badgeClass = 'badge-clean';
+            let badgeText = '0';
+            if (issues > 0) {
+                badgeClass = issues >= 5 ? 'badge-issues-high' : 'badge-issues-low';
+                badgeText  = String(issues);
+            }
+
+            btn.innerHTML = `
+                <span class="filename" title="${escapeHtml(fileEntry.filename)}">
+                    <i class="fas fa-file-pdf opacity-60 mr-2"></i>${escapeHtml(fileEntry.filename)}
+                </span>
+                <span class="badge ${badgeClass}">${badgeText}</span>
+            `;
+            btn.onclick = () => selectFileByIndex(fileEntry.index);
+            return btn;
+        }
+
+        function escapeHtml(s) {
+            return String(s).replace(/[&<>"']/g, c => ({
+                '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+            }[c]));
+        }
+
+        // Filter input
+        document.getElementById('sidebar-filter').addEventListener('input', (e) => {
+            sidebarFilter = e.target.value;
+            renderSidebar();
+            // Restore focus & cursor — innerHTML rebuild loses it
+            const f = document.getElementById('sidebar-filter');
+            f.focus();
+            f.setSelectionRange(f.value.length, f.value.length);
+        });
+
+        // Logic to handle switching between files (called by sidebar buttons)
+        function selectFileByIndex(index) {
+            document.querySelectorAll('.sidebar-file').forEach(b => b.classList.remove('active'));
+            const target = document.querySelector(`.sidebar-file[data-file-index="${index}"]`);
+            if (target) target.classList.add('active');
             renderFileResults(batchDataFiles[index].results);
         }
+
+        // Backwards-compat alias for any old code paths still calling selectFile
+        function selectFile(index, btn) { selectFileByIndex(index); }
 
         // Pushes the targeted payload into the accordions
         function renderFileResults(payload) {
