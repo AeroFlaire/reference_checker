@@ -141,7 +141,7 @@
             <div class="drop-zone rounded-3xl p-14 text-center cursor-pointer relative overflow-hidden" id="drop-area">
                 <div class="absolute inset-0 bg-gradient-to-b from-transparent to-slate-900/50 pointer-events-none"></div>
                 <input type="file" id="file-input" class="hidden" accept=".pdf" multiple>
-                
+
                 <div class="relative z-10 flex flex-col items-center justify-center">
                     <div class="w-20 h-20 bg-slate-800 rounded-full flex items-center justify-center mb-6 shadow-lg border border-slate-700">
                         <i class="fas fa-cloud-upload-alt text-4xl text-indigo-400"></i>
@@ -152,6 +152,37 @@
                         Select Files
                     </span>
                 </div>
+            </div>
+
+            <!-- Load an existing CLI batch run from /data/results/*.db -->
+            <div class="mt-6 glass-card rounded-2xl p-5">
+                <div class="flex items-center gap-3 mb-3">
+                    <div class="w-9 h-9 rounded-full bg-indigo-500/10 flex items-center justify-center border border-indigo-500/20">
+                        <i class="fas fa-database text-indigo-400 text-sm"></i>
+                    </div>
+                    <div class="flex-1">
+                        <h3 class="text-sm font-bold text-white">Or load an existing batch run</h3>
+                        <p class="text-[11px] text-slate-500 leading-snug">Pick a results DB created by <span class="font-mono text-slate-400">cli.py batch</span>.</p>
+                    </div>
+                </div>
+                <div class="flex flex-col sm:flex-row gap-2">
+                    <select id="batch-db-select"
+                            class="flex-1 px-3 py-2 text-sm bg-slate-900/60 border border-slate-700 rounded-md text-slate-200 focus:outline-none focus:border-indigo-500">
+                        <option value="">— loading list —</option>
+                    </select>
+                    <button id="batch-db-refresh"
+                            type="button"
+                            title="Refresh list"
+                            class="px-3 py-2 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-md text-slate-300 text-sm">
+                        <i class="fas fa-arrows-rotate"></i>
+                    </button>
+                    <button id="batch-db-load"
+                            type="button"
+                            class="px-4 py-2 bg-indigo-500 hover:bg-indigo-600 disabled:opacity-50 disabled:cursor-not-allowed text-white font-medium rounded-md text-sm">
+                        Load Results
+                    </button>
+                </div>
+                <p id="batch-db-error" class="hidden mt-2 text-xs text-red-400"></p>
             </div>
         </div>
 
@@ -321,6 +352,90 @@
             }
             uploadFiles(selected);
         }
+
+        // ---------------------------------------------------------------
+        //  Batch-DB loader: list .db files in /data/results and load one.
+        // ---------------------------------------------------------------
+        const batchDbSelect  = document.getElementById('batch-db-select');
+        const batchDbRefresh = document.getElementById('batch-db-refresh');
+        const batchDbLoad    = document.getElementById('batch-db-load');
+        const batchDbError   = document.getElementById('batch-db-error');
+
+        function showBatchDbError(msg) {
+            if (!msg) {
+                batchDbError.classList.add('hidden');
+                batchDbError.textContent = '';
+            } else {
+                batchDbError.classList.remove('hidden');
+                batchDbError.textContent = msg;
+            }
+        }
+
+        function formatBytes(n) {
+            if (n < 1024) return `${n} B`;
+            if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+            if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+            return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
+        }
+
+        async function refreshBatchDbList() {
+            showBatchDbError('');
+            batchDbSelect.innerHTML = '<option value="">— loading list —</option>';
+            batchDbLoad.disabled = true;
+            try {
+                const r = await fetch('/api/batch-results/list');
+                const data = await r.json();
+                const dbs = data.dbs || [];
+                if (dbs.length === 0) {
+                    batchDbSelect.innerHTML =
+                        `<option value="">(no .db files found in ${data.dir || '/data/results'})</option>`;
+                    return;
+                }
+                // Newest first
+                dbs.sort((a, b) => (b.mtime || 0) - (a.mtime || 0));
+                batchDbSelect.innerHTML =
+                    '<option value="">— select a results DB —</option>' +
+                    dbs.map(d => {
+                        const when = d.mtime ? new Date(d.mtime * 1000).toLocaleString() : '';
+                        const size = d.size != null ? formatBytes(d.size) : '';
+                        const meta = [size, when].filter(Boolean).join(' · ');
+                        return `<option value="${escapeHtml(d.name)}">${escapeHtml(d.name)}${meta ? '  (' + meta + ')' : ''}</option>`;
+                    }).join('');
+            } catch (e) {
+                batchDbSelect.innerHTML = '<option value="">(failed to load list)</option>';
+                showBatchDbError('Could not list batch results: ' + e.message);
+            }
+        }
+
+        batchDbSelect.addEventListener('change', () => {
+            batchDbLoad.disabled = !batchDbSelect.value;
+        });
+        batchDbRefresh.addEventListener('click', refreshBatchDbList);
+        batchDbLoad.addEventListener('click', loadBatchDb);
+
+        async function loadBatchDb() {
+            const name = batchDbSelect.value;
+            if (!name) return;
+            showBatchDbError('');
+            uploadSection.classList.add('hidden');
+            loadingSection.classList.remove('hidden');
+            try {
+                const r = await fetch('/api/batch-results/load?name=' + encodeURIComponent(name));
+                if (!r.ok) {
+                    const err = await r.json().catch(() => ({}));
+                    throw new Error(err.error || `HTTP ${r.status}`);
+                }
+                const data = await r.json();
+                handleDataResponse(data);
+            } catch (e) {
+                loadingSection.classList.add('hidden');
+                uploadSection.classList.remove('hidden');
+                showBatchDbError('Could not load: ' + e.message);
+            }
+        }
+
+        // Populate the dropdown on first paint.
+        refreshBatchDbList();
 
         async function uploadFiles(files) {
             uploadSection.classList.add('hidden');

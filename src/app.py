@@ -3,6 +3,7 @@ Thin Flask wrapper around the pipeline. Routes preserve the contract that
 index.html already expects, so the existing UI works unchanged.
 """
 import os
+import sqlite3
 import concurrent.futures
 from flask import Flask, jsonify, request, send_file
 from werkzeug.utils import secure_filename
@@ -11,6 +12,21 @@ import config
 from cache import get_cache
 from grobid_client import grobid_alive, wait_for_grobid
 from pipeline import process_references_list, process_pdf_file, merge_result_sets
+
+
+# Directory the CLI writes batch results into. Same dir the user passes to
+# `cli.py batch --output ...`. We list every .db file here for the UI.
+BATCH_RESULTS_DIR = os.path.dirname(config.RESULTS_DB) or "."
+
+# Bucket name (in the SQLite results DB) → key the frontend expects on the
+# per-reference payload. See _RESULTS_SCHEMA in cli.py and renderList() in
+# index.html for the two ends of this contract.
+_BUCKET_TO_MATCH_KEY = {
+    "verified": "openalex_match",
+    "edition_mismatch": "openalex_match (edition mismatch)",
+    "flawed_reference": "openalex_match (mismatched)",
+}
+_ALL_BUCKETS = ["verified", "edition_mismatch", "flawed_reference", "not_found", "not_reference"]
 
 ALLOWED_EXTENSIONS = {"pdf"}
 
@@ -134,6 +150,112 @@ def upload_pdfs_batch():
         "aggregate": aggregate,
         # back-compat keys for the existing frontend
         **aggregate,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Loading CLI batch results into the web UI
+# ---------------------------------------------------------------------------
+
+@app.route("/api/batch-results/list")
+def list_batch_dbs():
+    """Enumerate the .db files in BATCH_RESULTS_DIR so the UI can offer a picker."""
+    if not os.path.isdir(BATCH_RESULTS_DIR):
+        return jsonify({"dbs": [], "dir": BATCH_RESULTS_DIR})
+    dbs = []
+    for entry in sorted(os.listdir(BATCH_RESULTS_DIR)):
+        if not entry.endswith(".db"):
+            continue
+        full = os.path.join(BATCH_RESULTS_DIR, entry)
+        if not os.path.isfile(full):
+            continue
+        try:
+            mtime = int(os.path.getmtime(full))
+            size = os.path.getsize(full)
+        except OSError:
+            continue
+        dbs.append({"name": entry, "size": size, "mtime": mtime})
+    return jsonify({"dbs": dbs, "dir": BATCH_RESULTS_DIR})
+
+
+@app.route("/api/batch-results/load")
+def load_batch_db():
+    """Read a CLI-produced results DB and return JSON in the shape the existing
+    /api/upload-pdfs endpoint produces, so handleDataResponse() can render it."""
+    name = request.args.get("name", "")
+    # Reject anything that isn't a plain filename (no dirsep, no traversal).
+    if (not name) or name in (".", "..") or "/" in name or "\\" in name:
+        return jsonify({"error": "invalid name"}), 400
+    if not name.endswith(".db"):
+        return jsonify({"error": "must be a .db file"}), 400
+
+    db_path = os.path.join(BATCH_RESULTS_DIR, name)
+    if not os.path.isfile(db_path):
+        return jsonify({"error": f"not found: {name}"}), 404
+
+    files_by_name = {}
+    failed = 0
+
+    try:
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+            conn.row_factory = sqlite3.Row
+
+            for row in conn.execute(
+                "SELECT filename, status FROM file_status ORDER BY filename"
+            ):
+                if row["status"] == "error":
+                    failed += 1
+                    continue
+                files_by_name[row["filename"]] = {
+                    "filename": row["filename"],
+                    "status": "done",
+                    "results": {b: [] for b in _ALL_BUCKETS},
+                }
+
+            for row in conn.execute(
+                """SELECT filename, bucket, original_text, matched_title,
+                          matched_year, matched_url, matched_source, note
+                   FROM reference_results"""
+            ):
+                fobj = files_by_name.get(row["filename"])
+                if fobj is None:
+                    continue
+                bucket = row["bucket"] if row["bucket"] in _ALL_BUCKETS else "not_found"
+                payload = {"original_reference": row["original_text"] or ""}
+                match_key = _BUCKET_TO_MATCH_KEY.get(bucket)
+                if match_key:
+                    match = {
+                        "display_name": row["matched_title"] or "",
+                        "publication_year": row["matched_year"],
+                        "id": row["matched_url"] or "",
+                    }
+                    if row["note"]:
+                        match["note"] = row["note"]
+                    payload[match_key] = match
+                elif row["note"]:
+                    payload["note"] = row["note"]
+                fobj["results"][bucket].append(payload)
+    except sqlite3.DatabaseError as e:
+        return jsonify({"error": f"could not read db: {e}"}), 400
+
+    files = list(files_by_name.values())
+    aggregate = {b: [] for b in _ALL_BUCKETS}
+    for f in files:
+        for b in _ALL_BUCKETS:
+            aggregate[b].extend(f["results"].get(b, []))
+
+    return jsonify({
+        "mode": "batch",
+        "summary": {
+            "total_files": len(files) + failed,
+            "completed": len(files),
+            "failed": failed,
+        },
+        "files": files,
+        "aggregate": aggregate,
+        # Back-compat keys the existing frontend reads directly off `data`.
+        **aggregate,
+        "source": {"type": "batch_db", "name": name},
     })
 
 

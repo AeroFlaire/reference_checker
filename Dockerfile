@@ -9,7 +9,10 @@ RUN apt-get update \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+# Source lives in src/. Copying the directory contents (note the trailing slash)
+# puts every .py and index.html at /app/, preserving the flat-import layout the
+# Python modules depend on.
+COPY src/ .
 
 ENV PYTHONUNBUFFERED=1 \
     UPLOAD_FOLDER=/data/uploads \

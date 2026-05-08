@@ -11,7 +11,7 @@
 # Re-running it after the first time just brings the stack back up.
 set -euo pipefail
 
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 # --- 1. Check Docker ---
 if ! command -v docker &>/dev/null; then
@@ -40,7 +40,7 @@ fi
 
 # --- 2. First-run config ---
 if [[ ! -f .env ]]; then
-    cp .env.example .env
+    cp env.example .env
     cat <<EOF
 
 A new .env file has been created at:

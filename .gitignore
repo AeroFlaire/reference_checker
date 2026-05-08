@@ -1,7 +1,3 @@
-uploads/
-_pycache_/
-jobs.db
-
 # ---- Secrets ----
 .env
 .env.local

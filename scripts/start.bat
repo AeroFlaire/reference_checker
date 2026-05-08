@@ -2,7 +2,7 @@
 REM Single-command launcher for the reference checker on Windows.
 setlocal enabledelayedexpansion
 
-cd /d "%~dp0"
+cd /d "%~dp0\.."
 
 REM --- 1. Check Docker ---
 where docker >nul 2>&1
@@ -35,7 +35,7 @@ if errorlevel 1 (
 
 REM --- 2. First-run config ---
 if not exist ".env" (
-    copy ".env.example" ".env" >nul
+    copy "env.example" ".env" >nul
     echo.
     echo A new .env file has been created at:
     echo    %CD%\.env

@@ -10,7 +10,7 @@ Three things, aimed at making the tool deployable, scalable, and accurate
 enough for editorial use:
 
 1. **One-command setup.** No more separate Docker + Ollama + Flask steps.
-   `./start.sh` (or `start.bat` on Windows) brings up everything and waits
+   `./scripts/start.sh` (or `scripts\start.bat` on Windows) brings up everything and waits
    for it to be ready. Editors don't install Python, GROBID, or Ollama —
    just Docker Desktop.
 2. **Batch mode for hundreds of PDFs.** A `cli.py batch` command processes a
@@ -35,10 +35,10 @@ enough for editorial use:
 
 ```bash
 # macOS / Linux
-./start.sh
+./scripts/start.sh
 
 # Windows
-start.bat
+scripts\start.bat
 ```
 
 On the first run the script:
@@ -75,7 +75,7 @@ API cache with the web UI:
 
 ```bash
 # 1. Start the stack (only needed once per session)
-./start.sh
+./scripts/start.sh
 
 # 2. Place your PDFs somewhere under ./data so the container can see them.
 #    The compose file mounts ./data → /data inside the container.
@@ -243,21 +243,24 @@ docker compose exec app python -c "from cache import get_cache; get_cache().clea
 
 ```
 reference_checker/
-├── start.sh / start.bat       # One-command launcher
+├── scripts/
+│   ├── start.sh               # One-command launcher (macOS / Linux)
+│   └── start.bat              # One-command launcher (Windows)
+├── src/
+│   ├── index.html             # Web UI
+│   ├── app.py                 # Thin Flask wrapper
+│   ├── cli.py                 # Batch CLI
+│   ├── config.py              # Environment-based config
+│   ├── cache.py               # SQLite API cache
+│   ├── matching.py            # RapidFuzz title similarity
+│   ├── grobid_client.py       # GROBID full-doc + processCitation
+│   ├── sources.py             # OpenAlex / Crossref / S2 / WG21 / IETF / ISBN
+│   ├── verifier.py            # check_single_reference orchestrator
+│   └── pipeline.py            # Parallel batch driver
 ├── docker-compose.yml         # GROBID + app
 ├── Dockerfile                 # App image
-├── .env.example               # Configuration template
-├── requirements.txt
-├── index.html                 # Web UI (unchanged from previous version)
-├── app.py                     # Thin Flask wrapper
-├── cli.py                     # Batch CLI
-├── config.py                  # Environment-based config
-├── cache.py                   # SQLite API cache
-├── matching.py                # RapidFuzz title similarity
-├── grobid_client.py           # GROBID full-doc + processCitation
-├── sources.py                 # OpenAlex / Crossref / S2 / WG21 / IETF / ISBN
-├── verifier.py                # check_single_reference orchestrator
-└── pipeline.py                # Parallel batch driver
+├── env.example                # Configuration template
+└── requirements.txt
 ```
 
 ## License
