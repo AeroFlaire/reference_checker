@@ -23,6 +23,7 @@ from lxml import etree
 import fitz  # PyMuPDF
 
 import config
+from matching import repair_pdf_glyphs
 
 TEI_NS = {"tei": "http://www.tei-c.org/ns/1.0"}
 
@@ -268,6 +269,11 @@ def extract_references(pdf_path: str) -> list:
         if not raw_text:
             raw_text = " ".join(t.strip() for t in bibl.xpath(".//text()", namespaces=TEI_NS))
 
+        # PDFs often mangle separators (em-dash → "ś", soft-hyphen, etc.)
+        # and embed URL-encoded filenames. Repair before downstream regex
+        # matching so DOI / WG21 / year regexes can actually fire.
+        raw_text = repair_pdf_glyphs(raw_text)
+
         # 2. Append structured DOI if not already present
         doi_nodes = bibl.xpath(".//tei:idno[@type='DOI']/text()", namespaces=TEI_NS)
         if doi_nodes and doi_nodes[0] not in raw_text:
@@ -275,23 +281,65 @@ def extract_references(pdf_path: str) -> list:
 
         # 3. Structured metadata for the Phase-2 fast lane
         fields = _extract_biblstruct(bibl)
+        # Same glyph repair on the structured fields — GROBID inherits the
+        # PDF's character soup.
+        if fields.get("title"):
+            fields["title"] = repair_pdf_glyphs(fields["title"])
+        if fields.get("author"):
+            fields["author"] = repair_pdf_glyphs(fields["author"])
 
-        # 4. Suspicion heuristics — relaxed from the original:
-        #    - missing title AND missing author still suspicious
-        #    - very long blobs only flagged at >900 chars (was 600 — too aggressive)
-        #    - prose triggers require BOTH a "we/are/is/that" word AND no year token
+        # 4. Suspicion heuristics. The dominant failure mode is GROBID
+        # picking up body-text paragraphs from the PDF and treating them as
+        # references (e.g. "Hana is a header-only library for C++
+        # metaprogramming..."). The detector below catches those by
+        # counting prose sentences — multiple full sentences with normal
+        # English structure are almost never citations even when GROBID
+        # managed to fish a token out as a "title".
+        #
+        # We deliberately do NOT use the presence of a year, venue, or
+        # citation-like word as a "this must be a reference" signal: prose
+        # blurbs frequently mention years and product names too.
         is_suspicious = False
+
+        # 4a. Empty extraction with nothing to verify against
         if not fields["title"] and not fields["author"]:
             is_suspicious = True
-        if len(raw_text) > 900:
+
+        # 4b. Multi-sentence prose detector. Counts transitions like
+        # "lowercase. Uppercase" — a strong indicator of body prose.
+        # Real references rarely have more than one such transition (e.g.
+        # journal names like "Trans. on ..." produce one).
+        sentence_breaks = len(re.findall(r"[a-z]\.\s+[A-Z]", raw_text))
+        if sentence_breaks >= 2 and len(raw_text) > 200:
             is_suspicious = True
-        prose_triggers = [" we ", " our ", " is used ", " are used ", " can be "]
-        has_year = bool(re.search(r"\b(19|20)\d{2}\b", raw_text))
-        if (
-            len(raw_text) > 250
-            and any(t in raw_text.lower() for t in prose_triggers)
-            and not has_year
-        ):
+
+        # 4c. Opens with a "[Subject] [optional parenthetical] is/are/..."
+        # construction — a hallmark of marketing-blurb intros that get
+        # accidentally extracted as references. Tolerates parentheticals
+        # between the subject and the verb (e.g. "SYCL (pronounced
+        # 'sickle') is a royalty-free...").
+        if re.match(
+            r"^\s*[A-Z][\w.\-]*(?:\s+(?:\([^)]{0,40}\)|[A-Za-z\.\-]+)){0,3}\s+"
+            r"(?:is|are|was|were|provides?|enables?|allows?|builds?|"
+            r"controls?|boasts?|leverages?|aims?|consists?|works?|"
+            r"helps?|supports?)\s+",
+            raw_text,
+        ) and len(raw_text) > 200:
+            is_suspicious = True
+
+        # 4d. Long blob with no DOI / arXiv / WG21 paper id — almost
+        # certainly body prose. Real references this long usually have at
+        # least one of those identifiers. The 600-char cutoff was tuned
+        # against representative cases: legitimate long references (full
+        # author lists, vol/pp metadata) almost always carry a DOI; long
+        # blocks without one are body text.
+        has_strong_id = bool(re.search(
+            r"\b(?:doi[:\s]|10\.\d{4,9}/|arxiv[:\s]|"
+            r"\bRFC[\s-]?\d|\b[NP]\d{4}(?:R\d+)?\b)",
+            raw_text,
+            re.IGNORECASE,
+        ))
+        if len(raw_text) > 600 and not has_strong_id:
             is_suspicious = True
 
         extracted.append({

@@ -93,20 +93,64 @@ def lookup_openalex_doi(doi: str) -> Optional[dict]:
 
 
 def lookup_openalex_arxiv(arxiv_id: str) -> Optional[dict]:
+    """Find an arXiv preprint in OpenAlex.
+
+    OpenAlex does NOT expose an `ids.arxiv` filter (the documented ones are
+    openalex/doi/mag/pmid/pmcid only). Instead, arXiv-issued DOIs use the
+    `10.48550/arXiv.<id>` prefix that arXiv has minted on every paper since
+    2022 and retroactively on many earlier ones — so we try that DOI form
+    first. As a backstop, fall through to a free-text search of the bare ID
+    (OpenAlex indexes arXiv IDs in work metadata, so this often hits).
+    """
     if not arxiv_id:
         return None
     cache_query = {"endpoint": "openalex.arxiv", "arxiv": arxiv_id}
 
     def _fetch():
         url = "https://api.openalex.org/works"
-        params = {"filter": f"ids.arxiv:{arxiv_id}", "mailto": config.OPENALEX_EMAIL}
+        # Strategy 1: arXiv DOI prefix (works for the vast majority post-2022
+        # and most retroactive grants).
+        for filt in (
+            f"doi:https://doi.org/10.48550/arXiv.{arxiv_id}",
+            f"doi:10.48550/arXiv.{arxiv_id}",
+        ):
+            try:
+                resp = requests.get(
+                    url,
+                    params={"filter": filt, "mailto": config.OPENALEX_EMAIL},
+                    headers=_HEADERS,
+                    timeout=10,
+                )
+                if resp.status_code == 200:
+                    results = resp.json().get("results", [])
+                    if results:
+                        return results[0]
+            except requests.exceptions.RequestException:
+                pass
+
+        # Strategy 2: free-text search for the bare ID. OpenAlex indexes
+        # arXiv IDs in work metadata, so a search like "1507.08685" usually
+        # surfaces the paper as the top hit.
         try:
-            resp = requests.get(url, params=params, headers=_HEADERS, timeout=10)
+            resp = requests.get(
+                url,
+                params={"search": arxiv_id, "mailto": config.OPENALEX_EMAIL, "per-page": 5},
+                headers=_HEADERS,
+                timeout=10,
+            )
             if resp.status_code == 200:
                 results = resp.json().get("results", [])
-                return results[0] if results else None
+                # Only accept if the top hit clearly references this arXiv
+                # ID — guard against unrelated "search hit on a number"
+                # false positives.
+                for r in results[:3]:
+                    ids = r.get("ids") or {}
+                    blob = " ".join(str(v) for v in ids.values())
+                    if arxiv_id in blob:
+                        return r
         except requests.exceptions.RequestException:
             pass
+
         return None
 
     return get_cache().get_or_set("openalex_arxiv", cache_query, _fetch)
@@ -116,11 +160,15 @@ def lookup_openalex_arxiv(arxiv_id: str) -> Optional[dict]:
 # Crossref
 # ---------------------------------------------------------------------------
 
-def search_crossref(query: str) -> Optional[dict]:
+def search_crossref(query: str, rows: int = 5) -> list:
+    """Bibliographic-search Crossref. Returns a list of items (was: just the
+    top hit) so the verifier can score multiple candidates against the raw
+    reference — Crossref's ranking is decent but not perfect, and the
+    correct answer is occasionally at rank 2 or 3."""
     if not query or len(query) < 10:
-        return None
+        return []
 
-    cache_query = {"endpoint": "crossref.search", "q": query[:300]}
+    cache_query = {"endpoint": "crossref.search", "q": query[:300], "rows": rows}
 
     def _fetch():
         try:
@@ -128,20 +176,19 @@ def search_crossref(query: str) -> Optional[dict]:
                 "https://api.crossref.org/works",
                 params={
                     "query.bibliographic": query,
-                    "rows": 1,
+                    "rows": rows,
                     "mailto": config.OPENALEX_EMAIL or "anonymous@example.com",
                 },
                 headers=_HEADERS,
                 timeout=10,
             )
             if resp.status_code == 200:
-                items = resp.json().get("message", {}).get("items", [])
-                return items[0] if items else None
+                return resp.json().get("message", {}).get("items", []) or []
         except requests.exceptions.RequestException:
             pass
-        return None
+        return []
 
-    return get_cache().get_or_set("crossref_search", cache_query, _fetch)
+    return get_cache().get_or_set("crossref_search", cache_query, _fetch) or []
 
 
 def lookup_crossref_doi(doi: str) -> Optional[dict]:

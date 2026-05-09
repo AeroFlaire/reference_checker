@@ -29,6 +29,21 @@ from matching import (
     normalize_text,
     normalize_doi,
     repair_doi_with_linebreaks,
+    repair_pdf_glyphs,
+)
+
+
+# Conference / venue / publisher tokens that strongly imply something is a
+# real reference even when GROBID can't extract a clean title. Used by the
+# "is this just prose?" heuristic to keep marketing-blurb-shaped citations
+# in NOT_FOUND instead of NOT_REFERENCE (where editors never see them).
+_VENUE_TOKENS = re.compile(
+    r"\b(?:USENIX|ACM|IEEE|NeurIPS|NIPS|ICML|ICLR|CVPR|ECCV|ICCV|AAAI|"
+    r"OSDI|SOSP|SIGCOMM|SIGMOD|VLDB|EuroSys|HotOS|HotCloud|ATC|"
+    r"WG21|RFC|ISO|IETF|arXiv|Proceedings|Symposium|Conference|"
+    r"Journal|Trans\.|Springer|Elsevier|O'Reilly|Wiley|MIT Press|"
+    r"PMLR|JMLR)\b",
+    re.IGNORECASE,
 )
 
 
@@ -175,7 +190,11 @@ def check_single_reference(ref_data) -> Optional[dict]:
         g_arxiv = ref_data.get("grobid_arxiv")
         is_suspicious = ref_data.get("is_suspicious", False)
 
-    # Normalise: strip braces, kill known header pollution, collapse whitespace
+    # Normalise: strip braces, kill known header pollution, collapse whitespace.
+    # repair_pdf_glyphs unmangles separator glyphs (e.g. "2015ś2020" → "2015-2020")
+    # and URL-decodes embedded filename fragments before they reach the
+    # ASCII-fold step that would otherwise destroy their structure.
+    ref_string = repair_pdf_glyphs(ref_string)
     ref_string = ref_string.replace("{", "").replace("}", "")
     ref_string = ref_string.replace("Publication date", "")
     ref_string = re.sub(r"\s+", " ", ref_string).strip()
@@ -319,12 +338,35 @@ def check_single_reference(ref_data) -> Optional[dict]:
     # ===========================================================
     best_title_for_query = pc_title or g_title
     best_author_for_query = pc_author or g_author
+
+    # Try TWO Crossref queries: (1) GROBID-extracted title+author, and
+    # (2) the raw reference string. References frequently come out of PDFs
+    # with the author list before the title, or with a journal name where
+    # the title should be — GROBID then puts the wrong words in `title`,
+    # and query (1) misses. Query (2) treats the whole reference as a
+    # bibliographic search string, which is exactly what Crossref's
+    # `query.bibliographic` is designed for. Each candidate is scored
+    # against the raw reference and verified only if the candidate's title
+    # is contained in the raw ref or hits the similarity threshold — no
+    # new false positives.
+    cr_queries = []
     if best_title_for_query:
-        cr = sources.search_crossref(f"{best_title_for_query} {best_author_for_query}".strip())
-        if cr:
+        cr_queries.append(f"{best_title_for_query} {best_author_for_query}".strip())
+    if len(ref_string) >= 30:
+        cr_queries.append(ref_string[:300])
+
+    for cr_q in cr_queries:
+        for cr in sources.search_crossref(cr_q):
             cr_title = (cr.get("title") or [""])[0] or ""
-            score = title_similarity(best_title_for_query, cr_title)
-            if score >= config.VERIFY_SCORE:
+            if not cr_title or len(cr_title) < 8:
+                continue
+            # Score against the raw reference — the GROBID-extracted title
+            # may itself be wrong, so don't compare candidates against it.
+            # Accept the match if the candidate title appears verbatim in
+            # the reference OR similarity hits VERIFY_SCORE.
+            score = title_similarity(cr_title, ref_string)
+            title_in_ref = cr_title.lower() in ref_string.lower()
+            if title_in_ref or score >= config.VERIFY_SCORE:
                 cr_year = None
                 try:
                     cr_year = cr.get("published", {}).get("date-parts", [[None]])[0][0]
@@ -338,27 +380,70 @@ def check_single_reference(ref_data) -> Optional[dict]:
                 }
                 return _verified({
                     "original_reference": ref_string,
-                    "parsed_query": {"title": best_title_for_query, "source": "CROSSREF"},
+                    "parsed_query": {"title": best_title_for_query or "(raw)", "source": "CROSSREF"},
                     "openalex_match": match,
                 })
 
     # ===========================================================
     # PHASE 4 — Semantic Scholar search backstop
     # ===========================================================
+    # Same two-query approach as Phase 3.5: try title+author first, then
+    # the raw reference. S2's search is forgiving of free-form bibliographic
+    # input so the raw-string query frequently hits where structured search
+    # misses.
+    s2_queries = []
     if best_title_for_query:
-        s2_query = f"{best_title_for_query} {best_author_for_query}".strip()
-        if len(s2_query) < 15:
-            s2_query = ref_string[:200]
-        s2_match = sources.search_semantic_scholar(s2_query)
-        if s2_match:
-            s2_title = s2_match.get("display_name", "")
-            score = title_similarity(best_title_for_query, s2_title)
-            title_in_ref = bool(s2_title) and s2_title.lower() in ref_string.lower()
-            if score >= config.VERIFY_SCORE or title_in_ref:
+        q1 = f"{best_title_for_query} {best_author_for_query}".strip()
+        if len(q1) >= 15:
+            s2_queries.append(q1)
+    if len(ref_string) >= 30:
+        s2_queries.append(ref_string[:300])
+
+    for s2_q in s2_queries:
+        s2_match = sources.search_semantic_scholar(s2_q)
+        if not s2_match:
+            continue
+        s2_title = s2_match.get("display_name", "") or ""
+        if not s2_title or len(s2_title) < 8:
+            continue
+        score = title_similarity(s2_title, ref_string)
+        title_in_ref = s2_title.lower() in ref_string.lower()
+        if title_in_ref or score >= config.VERIFY_SCORE:
+            return _verified({
+                "original_reference": ref_string,
+                "parsed_query": {"title": best_title_for_query or "(raw)", "source": "S2"},
+                "openalex_match": s2_match,
+            })
+
+    # ===========================================================
+    # PHASE 4.25 — OpenAlex general-search backstop with raw reference
+    # ===========================================================
+    # Always run, regardless of whether GROBID extracted a title in earlier
+    # phases. The reason: when references are formatted as "[authors]
+    # [arxiv-id] [title] [year]" or "[title] [authors] [venue] [year]"
+    # without clear separators, GROBID frequently extracts an author name
+    # OR the journal name as the "title" — so Phase 2's structured search
+    # fires with the wrong query and misses. The raw-text /works?search=
+    # endpoint is bibliographic-string aware and finds these.
+    #
+    # We score the candidate against the raw reference (not the extracted
+    # title) because the parsed title is potentially wrong. We accept the
+    # match only if the candidate's title appears verbatim in the raw
+    # reference OR the similarity is above VERIFY_SCORE — both checks
+    # protect against false positives.
+    if len(ref_string) >= 30:
+        oa_results = sources.search_openalex(general_search=ref_string[:300])
+        for cand in oa_results[:10]:
+            cand_title = cand.get("display_name", "") or ""
+            if not cand_title or len(cand_title) < 8:
+                continue
+            score = title_similarity(cand_title, ref_string)
+            title_in_ref = cand_title.lower() in ref_string.lower()
+            if title_in_ref or score >= config.VERIFY_SCORE:
                 return _verified({
                     "original_reference": ref_string,
-                    "parsed_query": {"title": best_title_for_query, "source": "S2"},
-                    "openalex_match": s2_match,
+                    "parsed_query": {"title": "(raw)", "source": "OPENALEX_GENERAL"},
+                    "openalex_match": cand,
                 })
 
     # ===========================================================

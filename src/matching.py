@@ -11,7 +11,41 @@ config.VERIFY_SCORE / config.FLAWED_SCORE thresholds.
 """
 import re
 import unicodedata
+import urllib.parse
 from rapidfuzz import fuzz
+
+
+# PDF extractors love to mangle separators into accented Latin glyphs:
+#   em-dash → "ś" (U+015B), hyphen → "š" (U+0161), bullet → "·" (already ok)
+# These show up between years ("2015ś2020"), in compound words, and as
+# bibliographic separators. Map them to a real space/dash before the
+# unicode-fold step destroys their structure.
+_GLYPH_FIXES = str.maketrans({
+    "ś": "-",  # ś
+    "Ś": "-",  # Ś
+    "š": "-",  # š
+    "Š": "-",  # Š
+    "ź": "-",  # ź
+    "Ź": "-",  # Ź
+    "ż": "-",  # ż
+    "Ż": "-",  # Ż
+    "˚": "",   # ˚ (degree-like marks PDFs leave behind)
+    "­": "",   # soft hyphen
+})
+
+
+def repair_pdf_glyphs(text: str) -> str:
+    """Reverse common PDF mis-encodings of separators into accented Latin
+    glyphs, plus URL-decode any %xx sequences left in embedded filenames."""
+    if not text:
+        return ""
+    text = text.translate(_GLYPH_FIXES)
+    if "%" in text:
+        # Only touch obvious URL-encoded substrings — `%20`, `%2F`, etc.
+        # urllib.unquote is forgiving about non-encoded `%`s, so this is safe
+        # to apply to mixed text.
+        text = urllib.parse.unquote(text)
+    return text
 
 
 # Cheap stopwords list — only the ones that distort matching
