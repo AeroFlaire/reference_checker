@@ -11,7 +11,10 @@ specificity:
               (this replaces the old Ollama call)
   Phase 3.5— Crossref bibliographic-search backstop
   Phase 4  — Semantic Scholar search backstop
+  Phase 4.25 — OpenAlex general-search with raw reference
   Phase 4.5— OPTIONAL Ollama fallback (only if USE_OLLAMA_FALLBACK=true)
+  Phase 4.9— Web search + page metadata (final non-academic backstop:
+              news articles, NIST/standards docs, software project pages)
   Phase 5  — return NOT_FOUND (or NOT_REFERENCE if heuristically suspicious)
 
 Every external HTTP call goes through cache.py, so re-runs and corpus-wide
@@ -169,6 +172,138 @@ def _ollama_parse(reference_string: str) -> Optional[dict]:
         return json.loads(resp.json().get("response", "{}"))
     except (requests.exceptions.RequestException, ValueError):
         return None
+
+
+# ----- web-search backstop --------------------------------------------------
+
+def _make_web_match(w: dict, title: str, year, note: str) -> dict:
+    """Pack a web search result into the standard match shape (the same
+    shape OpenAlex / Crossref / S2 hits use, so downstream code doesn't
+    have to special-case web matches)."""
+    return {
+        "display_name": title or (w.get("title") or ""),
+        "publication_year": year,
+        "id": w.get("url", "") or "",
+        "note": note,
+    }
+
+
+def _web_verify(parsed_title: str, parsed_author, parsed_year, ref_string: str) -> tuple:
+    """Final backstop: search the web and confirm the cited work exists.
+
+    Returns one of:
+        ("VERIFIED",         match_dict)  — strong, paper confirmed
+        ("FLAWED_REFERENCE", match_dict)  — partial match, flag for review
+        (None, None)                      — no plausible match, fall through
+
+    Legitimacy is multi-step:
+      1. Score every candidate's snippet/title against the parsed title (or
+         raw reference if no parsed title is available). High similarity OR
+         verbatim title-in-reference → VERIFIED immediately.
+      2. For mid-confidence candidates (score >= MIN_CONSIDER_SCORE), GET
+         the page and read its <head> metadata. A page that exposes a
+         `citation_doi` lets us recurse into the academic-DB DOI lookup —
+         the strongest possible signal, since DOI registration is hard to
+         fake. Re-scoring against the page's declared <meta og:title>
+         catches cases where DDG truncated or rewrote the snippet.
+      3. Anything that scores in [FLAWED_SCORE, VERIFY_SCORE) after the
+         page fetch becomes FLAWED_REFERENCE — the editor sees it with
+         the discrepancy noted instead of it disappearing into NOT_FOUND.
+    """
+    if not ref_string or len(ref_string) < 20:
+        return None, None
+
+    # Build the search query — extracted title preferred, raw ref fallback.
+    if parsed_title and len(parsed_title) > 10:
+        q = parsed_title
+        a = parsed_author
+        if isinstance(a, list):
+            a = a[0] if a else ""
+        if a:
+            q = f"{q} {a}"
+    else:
+        q = ref_string[:250]
+
+    web_results = sources.search_web(q)
+    if not web_results:
+        return None, None
+
+    # Score against the parsed title when it's clean; against the raw
+    # reference when it isn't. The raw-text path catches cases where
+    # GROBID extracted the wrong span as the title.
+    compare_to = parsed_title if (parsed_title and len(parsed_title) > 8) else ref_string
+
+    best_flawed = None  # (score, match_dict) — kept only if no VERIFIED hit
+
+    for w in web_results:
+        rt = (w.get("title") or "").strip()
+        if not rt or len(rt) < 8:
+            continue
+
+        # Tier 1 — cheap scoring against the DDG result title.
+        score = title_similarity(compare_to, rt)
+        # Verbatim presence in the reference is corroborating evidence
+        # the snippet didn't accidentally win the similarity match.
+        if rt.lower() in ref_string.lower() and len(rt) > 12:
+            score = max(score, 92)
+
+        if score >= config.VERIFY_SCORE:
+            return "VERIFIED", _make_web_match(
+                w, rt, None, "Verified via web search (DuckDuckGo)"
+            )
+
+        # Below the consider threshold — not worth the page-fetch cost.
+        if score < config.MIN_CONSIDER_SCORE:
+            continue
+
+        url = w.get("url", "")
+        if not url:
+            continue
+
+        # Tier 2 — fetch the page and re-evaluate using its <head>.
+        md = sources.fetch_url_metadata(url)
+        if not md:
+            continue
+
+        # If the page exposes a DOI, that's the strongest signal we can
+        # ask for. Recurse into the academic-DB DOI path — turns a noisy
+        # web hit into a hard ID-based verification.
+        if md.get("doi"):
+            ndoi = normalize_doi(md["doi"])
+            if ndoi:
+                hit = sources.lookup_openalex_doi(ndoi)
+                if not hit:
+                    cr = sources.lookup_crossref_doi(ndoi)
+                    if cr:
+                        hit = _crossref_to_match(cr, "Verified via DOI from web page")
+                if hit:
+                    return "VERIFIED", hit
+
+        # Re-score using the page's canonical title (more reliable than
+        # the DDG snippet, which can be truncated or rewritten).
+        page_title = md.get("title") or rt
+        page_year = md.get("year")
+        s2 = title_similarity(compare_to, page_title)
+        if page_title.lower() in ref_string.lower() and len(page_title) > 12:
+            s2 = max(s2, 92)
+
+        if s2 >= config.VERIFY_SCORE:
+            return "VERIFIED", _make_web_match(
+                w, page_title, page_year,
+                "Verified via web search + page metadata",
+            )
+
+        if s2 >= config.FLAWED_SCORE:
+            cand_match = _make_web_match(
+                w, page_title, page_year,
+                "Web match — title differs from cited reference",
+            )
+            if best_flawed is None or s2 > best_flawed[0]:
+                best_flawed = (s2, cand_match)
+
+    if best_flawed:
+        return "FLAWED_REFERENCE", best_flawed[1]
+    return None, None
 
 
 # ----- main entrypoint ------------------------------------------------------
@@ -462,6 +597,35 @@ def check_single_reference(ref_data) -> Optional[dict]:
                     "parsed_query": {"title": o_title, "source": "OLLAMA"},
                     "openalex_match": match,
                 })
+
+    # ===========================================================
+    # PHASE 4.9 — Web search + page-metadata backstop
+    # ===========================================================
+    # Final attempt before bucketing as NOT_FOUND / NOT_REFERENCE. Catches
+    # references that legitimately exist but live outside academic DBs:
+    # news articles (NYT / Ars Technica / The Register coverage of OpenAI
+    # lawsuits), NIST Special Publications, software project pages
+    # (SPHINCS+, Open Quantum Safe, LeetCode), GitHub READMEs, blog posts.
+    # The two-tier match (snippet → page metadata → academic-DB DOI) is
+    # what keeps this from introducing false positives.
+    web_kind, web_match = _web_verify(
+        pc_title or g_title, pc_author or g_author, pc_year or g_year, ref_string
+    )
+    if web_kind == "VERIFIED" and web_match:
+        return _verified({
+            "original_reference": ref_string,
+            "parsed_query": {
+                "title": (pc_title or g_title) or "(raw)",
+                "source": "WEB_SEARCH",
+            },
+            "openalex_match": web_match,
+        })
+    # FLAWED_REFERENCE from the web only wins if no academic phase already
+    # gave us a YEAR_MISMATCH or a stronger flawed candidate to report.
+    if (web_kind == "FLAWED_REFERENCE" and web_match
+            and carry_status not in ("YEAR_MISMATCH", "FLAWED_REFERENCE")):
+        carry_status = "FLAWED_REFERENCE"
+        carry_flawed = web_match
 
     # ===========================================================
     # PHASE 5 — terminal: report carry status, NOT_FOUND, or NOT_REFERENCE

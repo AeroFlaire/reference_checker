@@ -10,11 +10,18 @@ Sources:
   - WG21         (C++ standards committee papers)
   - IETF         (RFCs)
   - OpenLibrary  (books, by ISBN)
+  - DuckDuckGo HTML + page metadata (final web backstop — see search_web /
+                     fetch_url_metadata at the bottom of the file)
 """
+import html as _html_lib
 import re
 import time
+import urllib.parse
 import requests
 from typing import Optional
+
+from lxml import etree as _lxml_etree
+from lxml import html as _lxml_html
 
 import config
 from cache import get_cache
@@ -396,3 +403,247 @@ def check_isbn(ref_string: str) -> Optional[dict]:
         return None
 
     return get_cache().get_or_set("openlibrary", cache_query, _fetch)
+
+
+# ---------------------------------------------------------------------------
+# Web search + page-metadata harvest (final non-academic backstop)
+# ---------------------------------------------------------------------------
+#
+# Why this exists: a non-trivial fraction of references in real corpora live
+# entirely outside academic databases — news articles ("Authors Sue OpenAI"
+# — NYT, Ars Technica), NIST Special Publications, IETF drafts, software
+# project pages (SPHINCS+, Open Quantum Safe, LeetCode), GitHub READMEs,
+# blog posts. None of those are in OpenAlex / Crossref / S2, so they get
+# bucketed as NOT_FOUND despite being trivially verifiable on the web.
+#
+# Two pieces below:
+#   search_web()         — DuckDuckGo HTML scrape (no API key required).
+#   fetch_url_metadata() — GET a candidate URL and harvest <title>, <meta
+#                          og:title>, <meta citation_doi>, etc. Used by the
+#                          verifier to confirm a hit is the real article
+#                          rather than a coincidentally-matching snippet.
+
+# A recent Firefox UA — DDG serves a CAPTCHA page to obvious Python/curl
+# UAs. One real-browser string is enough; no need to rotate.
+_WEB_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) "
+    "Gecko/20100101 Firefox/124.0"
+)
+
+# URLs ending in these extensions are downloads, not articles. Fetching
+# them is a waste and risks pulling MB-scale binaries into the parser.
+_BINARY_URL_EXTS = (
+    ".pdf", ".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xls",
+    ".zip", ".gz", ".tar", ".rar", ".7z",
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg",
+    ".mp3", ".mp4", ".mov", ".avi", ".webm",
+)
+
+
+def search_web(query: str, num_results: int = 8) -> list:
+    """Free-text web search via DuckDuckGo HTML.
+
+    Returns a list of ``{"title", "snippet", "url"}`` dicts. Empty list
+    means DDG answered with no usable results; callers cannot tell that
+    apart from a network failure (we cache empties as the genuine answer).
+    """
+    if not query or len(query) < 10:
+        return []
+    cache_query = {"endpoint": "ddg.html", "q": query[:300]}
+
+    def _fetch():
+        # GET first, POST as fallback — different DDG mirrors / proxies
+        # accept different methods, and silently returning empty on a
+        # transient failure would poison the cache for CACHE_TTL_DAYS.
+        body = None
+        for method in ("get", "post"):
+            try:
+                if method == "get":
+                    resp = requests.get(
+                        "https://html.duckduckgo.com/html/",
+                        params={"q": query[:300]},
+                        headers={
+                            "User-Agent": _WEB_UA,
+                            "Accept": "text/html,application/xhtml+xml",
+                            "Accept-Language": "en-US,en;q=0.5",
+                        },
+                        timeout=12,
+                    )
+                else:
+                    resp = requests.post(
+                        "https://html.duckduckgo.com/html/",
+                        data={"q": query[:300]},
+                        headers={
+                            "User-Agent": _WEB_UA,
+                            "Accept": "text/html,application/xhtml+xml",
+                            "Accept-Language": "en-US,en;q=0.5",
+                        },
+                        timeout=12,
+                    )
+            except requests.exceptions.RequestException:
+                continue
+            if resp.status_code == 200 and resp.content:
+                body = resp.content
+                break
+
+        if not body:
+            # Don't cache transient HTTP/network failures — `None` is
+            # excluded from the cache by get_or_set, so the next run
+            # retries instead of returning a stale empty list.
+            return None
+
+        # DDG returns HTTP 200 even for its anti-bot anomaly page. Detect
+        # the marker text and treat as a transient failure.
+        if b"anomaly-modal" in body or b"DDG-anomaly" in body:
+            return None
+
+        try:
+            tree = _lxml_html.fromstring(body)
+        except (ValueError, _lxml_etree.LxmlError):
+            return None
+
+        results = []
+        for r in tree.xpath(
+            "//div[contains(@class,'result__body') "
+            "or contains(@class,'web-result')]"
+        ):
+            t_nodes = r.xpath(".//a[contains(@class,'result__a')]//text()")
+            u_nodes = r.xpath(".//a[contains(@class,'result__a')]/@href")
+            s_nodes = r.xpath(
+                ".//*[contains(@class,'result__snippet')]//text() | "
+                ".//*[contains(@class,'result-snippet')]//text()"
+            )
+            title = _html_lib.unescape(" ".join(s.strip() for s in t_nodes)).strip()
+            snippet = _html_lib.unescape(" ".join(s.strip() for s in s_nodes)).strip()
+            url = u_nodes[0] if u_nodes else ""
+            # DDG wraps outbound links through `/l/?uddg=<encoded>`. Decode
+            # so the verified-ref entry stores a real article URL.
+            if url.startswith("//"):
+                url = "https:" + url
+            if "duckduckgo.com/l/" in url or url.startswith("/l/"):
+                m = re.search(r"[?&]uddg=([^&]+)", url)
+                if m:
+                    url = urllib.parse.unquote(m.group(1))
+            if title:
+                results.append({"title": title, "snippet": snippet, "url": url})
+            if len(results) >= num_results:
+                break
+        return results
+
+    return get_cache().get_or_set("ddg_html", cache_query, _fetch) or []
+
+
+# Meta-tag name preferences for fetch_url_metadata. Ordered most-canonical
+# first; we take the first non-empty value found.
+_META_TITLE_NAMES  = ("citation_title", "og:title", "twitter:title",
+                      "dc.title", "dcterms.title", "parsely-title")
+_META_DOI_NAMES    = ("citation_doi", "dc.identifier", "prism.doi")
+_META_AUTHOR_NAMES = ("citation_author", "author", "dc.creator", "article:author")
+_META_DATE_NAMES   = ("citation_publication_date", "citation_date",
+                      "article:published_time", "dc.date", "dcterms.issued")
+
+
+def _meta_lookup(tree, names) -> str:
+    """First non-empty <meta name=...> or <meta property=...> content,
+    matching case-insensitively. XPath 1.0 has no `lower-case()`, so we
+    use the standard translate() trick."""
+    for name in names:
+        n = name.lower()
+        xp = (
+            "//meta[("
+            "translate(@name,'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
+            f"'abcdefghijklmnopqrstuvwxyz')='{n}' or "
+            "translate(@property,'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
+            f"'abcdefghijklmnopqrstuvwxyz')='{n}'"
+            ")]/@content"
+        )
+        for v in tree.xpath(xp):
+            v = (v or "").strip()
+            if v:
+                return v
+    return ""
+
+
+def fetch_url_metadata(url: str) -> Optional[dict]:
+    """Fetch ``url`` and harvest structured metadata from its <head>.
+
+    Returns ``{"title", "doi", "author", "year"}`` (any may be empty / None)
+    or ``None`` if the URL is unfetchable, returns binary content, or yields
+    no usable title.
+
+    The verifier uses this as a *legitimacy check*: it confirms that the
+    page DDG pointed at really does describe the cited reference (rather
+    than just sharing a few keywords with it). When the page exposes a
+    `citation_doi`, the verifier recurses into the academic-DB DOI lookup
+    — turning a noisy web hit into a hard ID-based verification.
+    """
+    if not url or not isinstance(url, str):
+        return None
+    if not url.startswith(("http://", "https://")):
+        return None
+    base = url.lower().split("?", 1)[0].split("#", 1)[0]
+    if any(base.endswith(ext) for ext in _BINARY_URL_EXTS):
+        return None
+
+    cache_query = {"endpoint": "url.metadata", "url": url}
+
+    def _fetch():
+        try:
+            resp = requests.get(
+                url,
+                headers={
+                    "User-Agent": _WEB_UA,
+                    "Accept": "text/html,application/xhtml+xml",
+                    "Accept-Language": "en-US,en;q=0.5",
+                    # Only the <head> matters; cap bandwidth at 256 KB.
+                    "Range": "bytes=0-262143",
+                },
+                timeout=10,
+                allow_redirects=True,
+            )
+        except requests.exceptions.RequestException:
+            return None
+        if resp.status_code not in (200, 206):
+            return None
+        ctype = (resp.headers.get("Content-Type") or "").lower()
+        if ctype and "html" not in ctype and "xml" not in ctype:
+            return None
+        body = resp.content[:524288]
+        if not body:
+            return None
+        try:
+            tree = _lxml_html.fromstring(body)
+        except (ValueError, _lxml_etree.LxmlError):
+            return None
+
+        title = _meta_lookup(tree, _META_TITLE_NAMES)
+        if not title:
+            t_nodes = tree.xpath("//title//text()")
+            if t_nodes:
+                title = " ".join(s.strip() for s in t_nodes).strip()
+        title = re.sub(r"\s+", " ", _html_lib.unescape(title)).strip()
+        if not title:
+            return None
+
+        doi = ""
+        raw_doi = _meta_lookup(tree, _META_DOI_NAMES)
+        if raw_doi:
+            m = re.search(r"(10\.\d{4,9}/[^\s\"'<>]+)", raw_doi)
+            if m:
+                doi = m.group(1).rstrip(".,;)\"'")
+
+        author = _meta_lookup(tree, _META_AUTHOR_NAMES)
+
+        year = None
+        raw_year = _meta_lookup(tree, _META_DATE_NAMES)
+        if raw_year:
+            ym = re.search(r"\b(19|20)\d{2}\b", raw_year)
+            if ym:
+                try:
+                    year = int(ym.group(0))
+                except ValueError:
+                    pass
+
+        return {"title": title, "doi": doi, "author": author, "year": year}
+
+    return get_cache().get_or_set("url_metadata", cache_query, _fetch)

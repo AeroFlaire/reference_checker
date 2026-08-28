@@ -7,6 +7,41 @@ docker compose loads it automatically. For development you can also `export`
 the variables manually.
 """
 import os
+from pathlib import Path
+
+
+def _load_dotenv_once() -> None:
+    """Merge a project-root `.env` file into os.environ.
+
+    Docker Compose auto-loads `.env` via `env_file:` in the compose YAML.
+    Running the CLI directly (outside Docker) does not — which silently
+    disables OPENALEX_EMAIL / S2_API_KEY / CACHE_DB overrides. This minimal
+    parser handles `KEY=VALUE` lines, `#` comments, and optional surrounding
+    quotes; we don't pull in python-dotenv as a dependency.
+
+    Existing env vars win, so an explicit `$env:FOO = "bar"` (PowerShell)
+    or `export FOO=bar` (bash) still overrides what's in `.env`.
+    """
+    here = Path(__file__).resolve()
+    for parent in (here.parent, *here.parents):
+        env_path = parent / ".env"
+        if env_path.is_file():
+            try:
+                for line in env_path.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, _, value = line.partition("=")
+                    key = key.strip()
+                    value = value.strip().strip("'").strip('"')
+                    if key and key not in os.environ:
+                        os.environ[key] = value
+            except OSError:
+                pass
+            return
+
+
+_load_dotenv_once()
 
 
 def _bool(name: str, default: bool = False) -> bool:

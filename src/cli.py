@@ -266,6 +266,63 @@ def cmd_stats(args) -> int:
     return 0
 
 
+# Sources whose entries are "search results" — non-deterministic, can be
+# poisoned by a transient API outage that returns an empty list. Safe to
+# wipe; expensive ID lookups (DOI, arXiv, ISBN) are kept since their hits
+# don't go stale.
+_SEARCH_CACHE_SOURCES = (
+    "openalex_search", "crossref_search", "s2_search",
+    "ddg_html", "url_metadata",
+)
+
+
+def cmd_cache(args) -> int:
+    """Inspect or clear the API cache.
+
+    With no flags: print a per-source breakdown and exit.
+    --clear-search:  drop only the search-style caches (openalex_search,
+                     crossref_search, s2_search, ddg_html, url_metadata).
+                     ID lookups (DOIs, arXiv, ISBN, RFC) are preserved
+                     because their answers don't go stale.
+    --clear-all:     wipe the entire API cache.
+    """
+    cache = get_cache()
+
+    if args.clear_all:
+        cache.clear()
+        print(f"Cleared entire API cache ({cache.db_path}).")
+        return 0
+
+    if args.clear_search:
+        with sqlite3.connect(cache.db_path) as conn:
+            placeholders = ",".join("?" * len(_SEARCH_CACHE_SOURCES))
+            cur = conn.execute(
+                f"DELETE FROM api_cache WHERE source IN ({placeholders})",
+                _SEARCH_CACHE_SOURCES,
+            )
+            conn.commit()
+            removed = cur.rowcount
+        print(f"Cleared {removed} cached search entries from "
+              f"{cache.db_path}\n  (sources: {', '.join(_SEARCH_CACHE_SOURCES)})")
+        return 0
+
+    # Default — stats.
+    stats = cache.stats()
+    print(f"API cache: {cache.db_path}")
+    print(f"  total entries: {stats['total']}")
+    if stats["by_source"]:
+        print()
+        for src, n in stats["by_source"].items():
+            print(f"  {src:24s} {n}")
+    print(
+        "\nFlags:\n"
+        "  --clear-search   wipe poisoned search caches "
+        "(keeps reliable DOI/ID lookups)\n"
+        "  --clear-all      wipe everything"
+    )
+    return 0
+
+
 def cmd_export(args) -> int:
     if not os.path.exists(args.output):
         print(f"No results DB at {args.output}", file=sys.stderr)
@@ -333,6 +390,20 @@ def build_parser() -> argparse.ArgumentParser:
     ps = sub.add_parser("stats", help="Show results-DB summary")
     ps.add_argument("--output", default=config.RESULTS_DB)
 
+    pcache = sub.add_parser(
+        "cache",
+        help="Inspect or clear the API cache",
+    )
+    pcache.add_argument(
+        "--clear-search", action="store_true",
+        help="Drop search-style caches (openalex_search, crossref_search, "
+             "s2_search, ddg_html, url_metadata). Keeps reliable ID lookups.",
+    )
+    pcache.add_argument(
+        "--clear-all", action="store_true",
+        help="Wipe the entire API cache.",
+    )
+
     pe = sub.add_parser("export", help="Export references from the results DB")
     pe.add_argument("--output", default=config.RESULTS_DB,
                     help="Results DB path (input)")
@@ -351,6 +422,7 @@ def main(argv=None) -> int:
         "check":  cmd_check,
         "batch":  cmd_batch,
         "stats":  cmd_stats,
+        "cache":  cmd_cache,
         "export": cmd_export,
     }[args.cmd](args)
 

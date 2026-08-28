@@ -7,7 +7,7 @@ services:
     environment:
       # If you have plenty of RAM, bump to -Xmx6g for faster processing.
       # If Docker Desktop is memory-constrained (<6GB), drop to -Xmx2g.
-      - JAVA_OPTS=-Xmx4g
+      - JAVA_OPTS=-Xmx4g -XX:-UseContainerSupport
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:8070/api/isalive || exit 1"]
       interval: 10s
