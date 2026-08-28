@@ -29,7 +29,6 @@ enough for editorial use:
 ## Prerequisites
 
 - **Docker Desktop** ([download](https://www.docker.com/products/docker-desktop/)).
-- That's it. No Python, no GROBID, no Ollama.
 
 ## Quick start
 
