@@ -1,6 +1,7 @@
 uploads/
 jobs.db
 old_files
+/src/cache
 
 
 # ---- Secrets ----
