@@ -14,7 +14,9 @@ Sources:
                      fetch_url_metadata at the bottom of the file)
 """
 import html as _html_lib
+import random
 import re
+import threading
 import time
 import urllib.parse
 import requests
@@ -33,6 +35,84 @@ _HEADERS = {
     )
 }
 
+# OpenAlex moved to a credit model (~100 free requests/day). Once the daily
+# budget is gone, every further call is a guaranteed 429 — so record it and
+# stop asking, instead of silently turning thousands of good references into
+# "not_found".
+_openalex_budget_exhausted = False
+
+
+def _note_openalex_response(resp) -> bool:
+    """Return True if this response means the daily budget is gone.
+
+    Two different things produce a 429:
+      * short-term throttling — transient, and with a paid key latching the
+        whole run off would throw away credits we paid for;
+      * budget exhaustion — permanent until the midnight-UTC reset.
+
+    Distinguish them by Retry-After and the remaining-credit header, and only
+    latch on the second.
+    """
+    global _openalex_budget_exhausted
+    if resp.status_code != 429:
+        return False
+
+    retry_after = resp.headers.get("Retry-After", "")
+    remaining = resp.headers.get("X-RateLimit-Remaining-USD")
+    try:
+        wait = int(float(retry_after))
+    except (TypeError, ValueError):
+        wait = None
+    try:
+        credits_left = float(remaining)
+    except (TypeError, ValueError):
+        credits_left = None
+
+    # Short Retry-After AND credit still on the account => throttling, not
+    # exhaustion. Back off briefly and let the caller retry.
+    if wait is not None and wait <= 120 and (credits_left is None or credits_left > 0):
+        time.sleep(min(wait, 120))
+        return False
+
+    if not _openalex_budget_exhausted:
+        print(
+            "  !! OpenAlex 429: daily budget exhausted "
+            f"(Retry-After={retry_after or '?'}s, remaining-USD={remaining}). "
+            "Skipping OpenAlex for the rest of this run; "
+            "falling back to Crossref / Semantic Scholar."
+        )
+    _openalex_budget_exhausted = True
+    return True
+
+
+def _openalex_auth() -> dict:
+    """Query params that authenticate an OpenAlex request.
+
+    Prefer the API key (paid credit pool, ~1000 req/day); fall back to the
+    `mailto` polite pool when no key is configured. Verified against the live
+    API: the `api_key` query parameter, an `api_key` header, and
+    `Authorization: Bearer` all return 200 — the query parameter is the
+    documented form, so that is what we use.
+
+    config.OPENALEX_EMAIL is deliberately NOT removed elsewhere: Crossref's
+    polite pool and the shared User-Agent both depend on it.
+    """
+    if config.OPENALEX_API_KEY:
+        return {"api_key": config.OPENALEX_API_KEY}
+    return {"mailto": config.OPENALEX_EMAIL}
+
+
+def _oa_filter_safe(value: str) -> str:
+    """Make a value safe to embed in a comma-joined OpenAlex filter string.
+
+    OpenAlex joins filters with ",", so any comma inside a value is read as a
+    filter separator and the request fails with HTTP 400 ("A filter value
+    contains an unescaped comma"). Percent-encoding and backslash escaping
+    both still fail; replacing the comma with a space is the only workaround
+    that works, and it costs nothing because title.search tokenises anyway.
+    """
+    return re.sub(r"\s+", " ", str(value).replace(",", " ")).strip()
+
 
 # ---------------------------------------------------------------------------
 # OpenAlex
@@ -44,11 +124,13 @@ def search_openalex(
     year: Optional[int] = None,
     general_search: Optional[str] = None,
 ) -> list:
+    if _openalex_budget_exhausted:
+        return []
     base_url = "https://api.openalex.org/works"
     params = {
         "select": "id,display_name,authorships,publication_year,doi",
-        "mailto": config.OPENALEX_EMAIL,
         "per-page": 25,
+        **_openalex_auth(),
     }
 
     if general_search:
@@ -56,39 +138,50 @@ def search_openalex(
     else:
         filters = []
         if title:
-            filters.append(f"title.search:{title}")
+            filters.append(f"title.search:{_oa_filter_safe(title)}")
         if author:
-            filters.append(f"raw_author_name.search:{author}")
+            filters.append(f"raw_author_name.search:{_oa_filter_safe(author)}")
         if year:
             filters.append(f"publication_year:{year}")
         if not filters:
             return []
         params["filter"] = ",".join(filters)
 
-    cache_query = {"endpoint": "openalex.search", **params}
+    # Hash only the semantically meaningful params. Splatting `params` here
+    # would fold the credential into the cache key, so swapping mailto -> key
+    # (or rotating the key) would silently orphan every cached entry.
+    cache_query = {
+        "endpoint": "openalex.search",
+        "select": params.get("select"),
+        "per-page": params.get("per-page"),
+        "search": params.get("search"),
+        "filter": params.get("filter"),
+    }
 
     def _fetch():
         try:
             resp = requests.get(base_url, params=params, headers=_HEADERS, timeout=10)
             if resp.status_code == 200:
                 return resp.json().get("results", [])
-            return []
+            _note_openalex_response(resp)
+            return None
         except requests.exceptions.RequestException:
-            return []
+            return None
 
     return get_cache().get_or_set("openalex_search", cache_query, _fetch) or []
 
 
 def lookup_openalex_doi(doi: str) -> Optional[dict]:
-    if not doi:
+    if not doi or _openalex_budget_exhausted:
         return None
     cache_query = {"endpoint": "openalex.doi", "doi": doi}
 
     def _fetch():
         url = "https://api.openalex.org/works"
-        params = {"filter": f"doi:https://doi.org/{doi}", "mailto": config.OPENALEX_EMAIL}
+        params = {"filter": f"doi:https://doi.org/{doi}", **_openalex_auth()}
         try:
             resp = requests.get(url, params=params, headers=_HEADERS, timeout=10)
+            _note_openalex_response(resp)
             if resp.status_code == 200:
                 results = resp.json().get("results", [])
                 return results[0] if results else None
@@ -108,8 +201,8 @@ def lookup_openalex_arxiv(arxiv_id: str) -> Optional[dict]:
     2022 and retroactively on many earlier ones — so we try that DOI form
     first. As a backstop, fall through to a free-text search of the bare ID
     (OpenAlex indexes arXiv IDs in work metadata, so this often hits).
-    """
-    if not arxiv_id:
+    """ 
+    if not arxiv_id or _openalex_budget_exhausted:
         return None
     cache_query = {"endpoint": "openalex.arxiv", "arxiv": arxiv_id}
 
@@ -124,10 +217,12 @@ def lookup_openalex_arxiv(arxiv_id: str) -> Optional[dict]:
             try:
                 resp = requests.get(
                     url,
-                    params={"filter": filt, "mailto": config.OPENALEX_EMAIL},
+                    params={"filter": filt, **_openalex_auth()},
                     headers=_HEADERS,
                     timeout=10,
                 )
+                if _note_openalex_response(resp):
+                    return None
                 if resp.status_code == 200:
                     results = resp.json().get("results", [])
                     if results:
@@ -141,10 +236,11 @@ def lookup_openalex_arxiv(arxiv_id: str) -> Optional[dict]:
         try:
             resp = requests.get(
                 url,
-                params={"search": arxiv_id, "mailto": config.OPENALEX_EMAIL, "per-page": 5},
+                params={"search": arxiv_id, "per-page": 5, **_openalex_auth()},
                 headers=_HEADERS,
                 timeout=10,
             )
+            _note_openalex_response(resp)
             if resp.status_code == 200:
                 results = resp.json().get("results", [])
                 # Only accept if the top hit clearly references this arXiv
@@ -167,6 +263,38 @@ def lookup_openalex_arxiv(arxiv_id: str) -> Optional[dict]:
 # Crossref
 # ---------------------------------------------------------------------------
 
+_CROSSREF_MAX_RETRIES = 4
+
+
+def _crossref_get(url: str, params: Optional[dict] = None) -> Optional[requests.Response]:
+    """Crossref GET with bounded retry on 429 / 5xx.
+
+    Crossref is the PRIMARY backend after the phase reorder — roughly 5,000
+    searches per corpus run — and the batch drives it from up to 12 threads
+    (MAX_REF_WORKERS 6 x BATCH_PDF_WORKERS 2). Measured: 12 concurrent calls
+    produce 3x HTTP 429. Without a retry each of those silently drops a
+    reference into `not_found`; that is what cost run8 ~15 real matches whose
+    titles appear verbatim in the reference.
+
+    Retry with jittered backoff rather than a global throttle: serialising
+    5,000 queries would add well over an hour, whereas backing off only the
+    calls that actually get rejected costs almost nothing.
+    """
+    for attempt in range(_CROSSREF_MAX_RETRIES):
+        try:
+            resp = requests.get(url, params=params, headers=_HEADERS, timeout=10)
+        except requests.exceptions.RequestException:
+            return None
+        if resp.status_code < 500 and resp.status_code != 429:
+            return resp
+        try:
+            wait = float(resp.headers.get("Retry-After", ""))
+        except (TypeError, ValueError):
+            wait = 0.5 * (2 ** attempt) + random.uniform(0, 0.4)
+        time.sleep(min(wait, 8.0))
+    return None
+
+
 def search_crossref(query: str, rows: int = 5) -> list:
     """Bibliographic-search Crossref. Returns a list of items (was: just the
     top hit) so the verifier can score multiple candidates against the raw
@@ -178,22 +306,22 @@ def search_crossref(query: str, rows: int = 5) -> list:
     cache_query = {"endpoint": "crossref.search", "q": query[:300], "rows": rows}
 
     def _fetch():
+        resp = _crossref_get(
+            "https://api.crossref.org/works",
+            {
+                "query.bibliographic": query,
+                "rows": rows,
+                "mailto": config.OPENALEX_EMAIL or "anonymous@example.com",
+            },
+        )
+        if resp is None:
+            return None
         try:
-            resp = requests.get(
-                "https://api.crossref.org/works",
-                params={
-                    "query.bibliographic": query,
-                    "rows": rows,
-                    "mailto": config.OPENALEX_EMAIL or "anonymous@example.com",
-                },
-                headers=_HEADERS,
-                timeout=10,
-            )
             if resp.status_code == 200:
                 return resp.json().get("message", {}).get("items", []) or []
-        except requests.exceptions.RequestException:
+        except ValueError:
             pass
-        return []
+        return None
 
     return get_cache().get_or_set("crossref_search", cache_query, _fetch) or []
 
@@ -205,15 +333,13 @@ def lookup_crossref_doi(doi: str) -> Optional[dict]:
     cache_query = {"endpoint": "crossref.doi", "doi": doi}
 
     def _fetch():
+        resp = _crossref_get(f"https://api.crossref.org/works/{doi}")
+        if resp is None:
+            return None
         try:
-            resp = requests.get(
-                f"https://api.crossref.org/works/{doi}",
-                headers=_HEADERS,
-                timeout=10,
-            )
             if resp.status_code == 200:
                 return resp.json().get("message")
-        except requests.exceptions.RequestException:
+        except ValueError:
             pass
         return None
 
@@ -226,13 +352,47 @@ def lookup_crossref_doi(doi: str) -> Optional[dict]:
 
 # S2 free tier is strict: 100 req / 5 min. We rate-limit gently to avoid 429s.
 _s2_last_call = [0.0]
+_s2_lock = threading.Lock()
+
+# S2 returns 429 under burst. Each one used to be a silently lost lookup
+# (the fetch returns None and the reference falls through to not_found), so
+# retry a bounded number of times with backoff.
+_S2_MAX_RETRIES = 3
 
 
 def _s2_throttle():
-    elapsed = time.time() - _s2_last_call[0]
-    if elapsed < 1.0:
-        time.sleep(1.0 - elapsed)
-    _s2_last_call[0] = time.time()
+    """Serialise S2 calls to <=1 req/s ACROSS THREADS.
+
+    The batch runs MAX_REF_WORKERS (6) x BATCH_PDF_WORKERS (2) = up to 12
+    concurrent threads. Without the lock they all read the same
+    _s2_last_call, compute the same sleep, wake together and fire as a
+    burst — which measured ~25% 429s. Holding the lock across the sleep is
+    the point: it is what actually spaces the requests out.
+    """
+    with _s2_lock:
+        elapsed = time.time() - _s2_last_call[0]
+        if elapsed < 1.0:
+            time.sleep(1.0 - elapsed)
+        _s2_last_call[0] = time.time()
+
+
+def _s2_get(url: str, params: dict) -> Optional[requests.Response]:
+    """Throttled GET with bounded retry on 429. None if it never succeeded."""
+    for attempt in range(_S2_MAX_RETRIES):
+        _s2_throttle()
+        try:
+            resp = requests.get(url, params=params, headers=_s2_headers(), timeout=10)
+        except requests.exceptions.RequestException:
+            return None
+        if resp.status_code != 429:
+            return resp
+        # Honour Retry-After when present, else exponential backoff.
+        try:
+            wait = float(resp.headers.get("Retry-After", ""))
+        except (TypeError, ValueError):
+            wait = 1.0 * (2 ** attempt)
+        time.sleep(min(wait, 10.0))
+    return None
 
 
 def _s2_headers():
@@ -246,14 +406,13 @@ def get_semantic_scholar_paper(paper_id: str) -> Optional[dict]:
     cache_query = {"endpoint": "s2.paper", "id": paper_id}
 
     def _fetch():
-        _s2_throttle()
+        resp = _s2_get(
+            f"https://api.semanticscholar.org/graph/v1/paper/{paper_id}",
+            {"fields": "title,authors,year,url,externalIds"},
+        )
+        if resp is None:
+            return None
         try:
-            resp = requests.get(
-                f"https://api.semanticscholar.org/graph/v1/paper/{paper_id}",
-                params={"fields": "title,authors,year,url,externalIds"},
-                headers=_s2_headers(),
-                timeout=10,
-            )
             if resp.status_code == 200:
                 item = resp.json()
                 if not item.get("title"):
@@ -264,7 +423,7 @@ def get_semantic_scholar_paper(paper_id: str) -> Optional[dict]:
                     "id": item.get("url"),
                     "note": "Verified via Semantic Scholar (ID match)",
                 }
-        except requests.exceptions.RequestException:
+        except ValueError:
             pass
         return None
 
@@ -277,14 +436,13 @@ def search_semantic_scholar(query: str) -> Optional[dict]:
     cache_query = {"endpoint": "s2.search", "q": query[:300]}
 
     def _fetch():
-        _s2_throttle()
+        resp = _s2_get(
+            "https://api.semanticscholar.org/graph/v1/paper/search",
+            {"query": query, "limit": 1, "fields": "title,authors,year,url,externalIds"},
+        )
+        if resp is None:
+            return None
         try:
-            resp = requests.get(
-                "https://api.semanticscholar.org/graph/v1/paper/search",
-                params={"query": query, "limit": 1, "fields": "title,authors,year,url,externalIds"},
-                headers=_s2_headers(),
-                timeout=10,
-            )
             if resp.status_code == 200:
                 data = resp.json()
                 if data.get("data"):
@@ -295,7 +453,7 @@ def search_semantic_scholar(query: str) -> Optional[dict]:
                         "id": item.get("url"),
                         "note": "Verified via Semantic Scholar",
                     }
-        except requests.exceptions.RequestException:
+        except ValueError:
             pass
         return None
 
@@ -503,6 +661,10 @@ def search_web(query: str, num_results: int = 8) -> list:
             return None
 
         results = []
+        # DDG nests `result__body` INSIDE `web-result`, so the OR-matching
+        # XPath below hits every result twice. Dedupe on URL, otherwise
+        # num_results=8 really means 4 distinct candidates.
+        seen_urls = set()
         for r in tree.xpath(
             "//div[contains(@class,'result__body') "
             "or contains(@class,'web-result')]"
@@ -524,11 +686,13 @@ def search_web(query: str, num_results: int = 8) -> list:
                 m = re.search(r"[?&]uddg=([^&]+)", url)
                 if m:
                     url = urllib.parse.unquote(m.group(1))
-            if title:
+            dedupe_key = url or title
+            if title and dedupe_key not in seen_urls:
+                seen_urls.add(dedupe_key)
                 results.append({"title": title, "snippet": snippet, "url": url})
             if len(results) >= num_results:
                 break
-        return results
+        return results or None
 
     return get_cache().get_or_set("ddg_html", cache_query, _fetch) or []
 

@@ -49,7 +49,15 @@ def _bool(name: str, default: bool = False) -> bool:
 
 
 # --- Required for polite-pool access to OpenAlex / Crossref ---
+# NOTE: despite the name this is NOT OpenAlex-only. Crossref's polite pool
+# (sources.search_crossref) and the shared User-Agent both use it, and
+# Crossref is the PRIMARY backend — do not remove it when adding an API key.
 OPENALEX_EMAIL = os.environ.get("OPENALEX_EMAIL", "").strip()
+
+# --- OpenAlex API key. Optional, but the keyless free tier is ~100
+# requests/day (a paid key is ~1000/day), so batch runs exhaust it almost
+# immediately. When set it replaces `mailto` on OpenAlex calls only. ---
+OPENALEX_API_KEY = os.environ.get("OPENALEX_API_KEY", "").strip()
 
 # --- Optional, but boosts S2 rate limits if present ---
 S2_API_KEY = os.environ.get("S2_API_KEY", "").strip()
@@ -87,6 +95,12 @@ def warn_if_misconfigured():
         msgs.append(
             "  ⚠  OPENALEX_EMAIL is not set. OpenAlex will work but at lower rate "
             "limits (slower batches). Set it in your .env file."
+        )
+    if not OPENALEX_API_KEY:
+        msgs.append(
+            "  ⚠  OPENALEX_API_KEY is not set. OpenAlex is capped near ~100 "
+            "requests/day and will self-disable early in a batch run. Set it "
+            "in your .env file (NOT env.example — the app only reads .env)."
         )
     if msgs:
         print("\n".join(msgs))

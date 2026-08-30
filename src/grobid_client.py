@@ -26,6 +26,31 @@ import config
 from matching import repair_pdf_glyphs
 
 TEI_NS = {"tei": "http://www.tei-c.org/ns/1.0"}
+_TEI_NS_URI = b"http://www.tei-c.org/ns/1.0"
+
+
+def _ensure_tei_ns(body: bytes) -> bytes:
+    """Give a namespace-less TEI fragment the TEI default namespace.
+
+    /api/processCitation returns a BARE `<biblStruct >` with no xmlns, while
+    /api/processFulltextDocument returns a full TEI document that declares
+    it. _extract_biblstruct() queries with `tei:`-prefixed XPath, so without
+    this the citation fragment silently yields empty strings for every field
+    — which is exactly what happened: `GROBID_processCitation` produced zero
+    matches across run4, run5 and run6, so Phase 2's re-parse never once
+    fired. GROBID itself was fine the whole time; only our parsing was wrong.
+
+    No-op when the fragment already declares a namespace, so this stays safe
+    if a future GROBID version starts emitting one.
+    """
+    m = re.search(rb"<\s*biblStruct\b[^>]*>", body)
+    if not m:
+        return body
+    tag = m.group(0)
+    if b"xmlns" in tag:
+        return body
+    name_end = m.start() + tag.index(b"biblStruct") + len(b"biblStruct")
+    return body[:name_end] + b' xmlns="' + _TEI_NS_URI + b'"' + body[name_end:]
 
 
 # ---------------------------------------------------------------------------
@@ -175,8 +200,10 @@ def grobid_process_citation(reference_string: str, timeout: int = 15) -> Optiona
             return None
 
         try:
-            # GROBID returns a TEI <biblStruct> at the document root
-            root = etree.fromstring(resp.content)
+            # GROBID returns a TEI <biblStruct> at the document root, but
+            # without an xmlns declaration — add one so the tei: XPath in
+            # _extract_biblstruct() can actually match.
+            root = etree.fromstring(_ensure_tei_ns(resp.content))
         except etree.XMLSyntaxError:
             _citation_memo[reference_string] = None
             return None
@@ -222,7 +249,15 @@ def _extract_biblstruct(node) -> dict:
             year = m.group(0)
 
     doi = _first_text(node, ".//tei:idno[@type='DOI']/text()")
+
+    # GROBID emits the id as "arXiv:1810.04805" (and sometimes
+    # "arXiv:1810.04805v2"). Callers build "10.48550/arXiv.<id>" DOIs and
+    # "ARXIV:<id>" S2 ids from this, so the prefix has to come off or every
+    # lookup is malformed. Harmless before the namespace fix, because this
+    # field was always empty.
     arxiv = _first_text(node, ".//tei:idno[@type='arXiv']/text()")
+    if arxiv:
+        arxiv = re.sub(r"(?i)^\s*arxiv[:\s.]*", "", arxiv).strip()
 
     return {
         "title": title,

@@ -65,6 +65,12 @@ def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+# Ceiling applied when one title is fully contained in a much longer one.
+# Must sit in [FLAWED_SCORE, VERIFY_SCORE) so such candidates are routed to
+# FLAWED_REFERENCE for human review instead of being auto-verified.
+_CONTAINED_TITLE_CAP = 85
+
+
 def _strip_subtitle(text: str) -> str:
     """Cut at first colon / semicolon / paren — common subtitle separators.
 
@@ -76,7 +82,7 @@ def _strip_subtitle(text: str) -> str:
     return re.split(r"[:;(\[]", text, maxsplit=1)[0].strip()
 
 
-def title_similarity(parsed: str, candidate: str) -> int:
+def title_similarity(parsed: str, candidate: str, contained_guard: bool = True) -> int:
     """Return 0–100 similarity between the parsed reference title and a
     candidate retrieved from a database.
 
@@ -123,14 +129,39 @@ def title_similarity(parsed: str, candidate: str) -> int:
     coverage = len(smaller & larger) / len(smaller)
     n_small = len(smaller)
 
+    # A candidate that fully covers the shorter title but carries a lot of
+    # extra content tokens is usually a DIFFERENT work that contains or
+    # discusses it — and partial_ratio scores those 100 regardless. Measured
+    # on run6: "CSTA Standards for CS Teachers" matched "Using CSTA Standards
+    # for CS Teachers to Design CS Teacher Pathways", and "Denoising
+    # diffusion probabilistic models" matched "...for Probabilistic Energy
+    # Forecasting". Use a proportional test, not an absolute token count:
+    # set semantics dedupe repeated words, so a genuinely different title can
+    # add as few as two new tokens.
+    #
+    # Genuine subtitles stay safe because _strip_subtitle() already feeds
+    # token_sort_ratio a subtitle-free variant, which sets `base` high on its
+    # own before we get here.
+    # CRITICAL: only meaningful when BOTH sides are titles. Several callers
+    # score a DB title against the RAW REFERENCE STRING, which legitimately
+    # carries far more tokens (authors, venue, year, pages) — there the size
+    # gap is normal, not evidence of a different work. Those callers pass
+    # contained_guard=False. Getting this wrong cost run7: "Attention Is All
+    # You Need" scored against its own reference dropped 100 -> 85, and
+    # verified fell 3690 -> 3484 with not_found up 442 -> 595.
+    much_longer = contained_guard and len(larger) > len(smaller) * 1.4
+
     # Tiered logic by size of the smaller content-token set:
     if coverage >= 0.95 and n_small >= 4:
         # Substantial title fully present → trust partial_ratio
         # (handles "Attention Is All You Need" → "Attention Is All You Need: Vaswani...")
-        base = max(base, partial_max)
+        # unless the candidate is much longer, in which case cap below
+        # VERIFY_SCORE so it lands in FLAWED_REFERENCE for an editor to judge.
+        base = max(base, min(partial_max, _CONTAINED_TITLE_CAP) if much_longer else partial_max)
     elif coverage >= 0.95 and n_small == 3:
-        # Borderline: trust partial up to 92, no further
-        base = max(base, min(partial_max, 92))
+        # Borderline: trust partial up to 92, no further — and only when the
+        # candidate is not much longer, since 92 is still above VERIFY_SCORE.
+        base = max(base, min(partial_max, _CONTAINED_TITLE_CAP if much_longer else 92))
     elif n_small <= 2:
         # Too short to disambiguate → cap conservatively
         base = min(base, 78 if coverage >= 1.0 else 70)

@@ -150,6 +150,93 @@ def _search_and_verify(parsed_title: str, parsed_author: str, parsed_year) -> tu
     return status, best_match, best_flawed
 
 
+def _crossref_search_and_verify(parsed_title: str, parsed_author, parsed_year,
+                                ref_string: str, alt_title: str = "",
+                                alt_author="") -> tuple:
+    """Crossref equivalent of _search_and_verify. Returns the same
+    (status, best_match, best_flawed) contract.
+
+    This is the PRIMARY bibliographic search. OpenAlex's ~100 request/day
+    credit budget makes it unusable as a primary backend at corpus scale,
+    and S2 is throttled to 1 req/s, so Crossref's polite pool is the only
+    backend that scales to thousands of PDFs per day.
+
+    Two queries, same rationale as the old Phase 3.5: (1) the GROBID-parsed
+    title+author, and (2) the raw reference string. References often come
+    out of PDFs with the author list before the title, or a journal name
+    where the title should be, so GROBID puts the wrong words in `title`
+    and query (1) misses. `query.bibliographic` is built for query (2).
+
+    Acceptance is deliberately two-tier:
+      * verbatim title-in-reference OR similarity-vs-raw-reference >=
+        VERIFY_SCORE  -> VERIFIED. This is the proven run4 logic and is
+        scored against the RAW reference, because the parsed title may
+        itself be wrong.
+      * otherwise the candidate is run through _score_candidate against the
+        parsed title, so Crossref can also produce YEAR_MISMATCH and
+        FLAWED_REFERENCE. Without this, demoting OpenAlex would silently
+        empty the `edition_mismatch` and `flawed_reference` buckets — the
+        two an editor actually reads.
+    """
+    queries = []
+    if parsed_title:
+        author_str = parsed_author or ""
+        if isinstance(author_str, list):
+            author_str = author_str[0] if author_str else ""
+        queries.append(f"{parsed_title} {author_str}".strip())
+    if alt_title:
+        # The other GROBID parse. Neither fulltext nor processCitation
+        # dominates, so try both against Crossref (unmetered).
+        alt_a = alt_author or ""
+        if isinstance(alt_a, list):
+            alt_a = alt_a[0] if alt_a else ""
+        queries.append(f"{alt_title} {alt_a}".strip())
+    if len(ref_string) >= 30:
+        queries.append(ref_string[:300])
+    if not queries:
+        return "NOT_FOUND", None, None
+
+    status, best_match, best_flawed = "NOT_FOUND", None, None
+    seen_q = set()
+    for q in queries:
+        if not q or q in seen_q:
+            continue
+        seen_q.add(q)
+        for cr in sources.search_crossref(q):
+            cand = _crossref_to_match(cr, "Verified via Crossref")
+            cand_title = cand.get("display_name") or ""
+            if len(cand_title) < 8:
+                continue
+
+            # Tier 1 — score against the raw reference (proven run4 logic).
+            # ref_string is a raw reference, not a title -> guard off
+            raw_score = title_similarity(cand_title, ref_string, contained_guard=False)
+            if cand_title.lower() in ref_string.lower() or raw_score >= config.VERIFY_SCORE:
+                return "VERIFIED", cand, None
+
+            # Tier 2 — score against the parsed title so Crossref can also
+            # emit the triage verdicts.
+            title_options = [t for t in (parsed_title, alt_title) if t]
+            if not title_options:
+                continue
+            cstatus, scored = "REJECT", cand
+            for t in title_options:
+                st_, _, _, sc_ = _score_candidate(t, parsed_year, cand)
+                if st_ == "VERIFIED":
+                    cstatus, scored = st_, sc_
+                    break
+                if cstatus == "REJECT" and st_ != "REJECT":
+                    cstatus, scored = st_, sc_
+            if cstatus == "VERIFIED":
+                return "VERIFIED", scored, None
+            if cstatus == "YEAR_MISMATCH" and status == "NOT_FOUND":
+                status, best_match = "YEAR_MISMATCH", scored
+            elif cstatus == "FLAWED_REFERENCE" and status == "NOT_FOUND":
+                status, best_flawed = "FLAWED_REFERENCE", scored
+
+    return status, best_match, best_flawed
+
+
 # ----- optional Ollama fallback (only used if explicitly enabled) -----------
 
 def _ollama_parse(reference_string: str) -> Optional[dict]:
@@ -231,7 +318,8 @@ def _web_verify(parsed_title: str, parsed_author, parsed_year, ref_string: str) 
     # Score against the parsed title when it's clean; against the raw
     # reference when it isn't. The raw-text path catches cases where
     # GROBID extracted the wrong span as the title.
-    compare_to = parsed_title if (parsed_title and len(parsed_title) > 8) else ref_string
+    _cmp_is_title = bool(parsed_title and len(parsed_title) > 8)
+    compare_to = parsed_title if _cmp_is_title else ref_string
 
     best_flawed = None  # (score, match_dict) — kept only if no VERIFIED hit
 
@@ -241,7 +329,7 @@ def _web_verify(parsed_title: str, parsed_author, parsed_year, ref_string: str) 
             continue
 
         # Tier 1 — cheap scoring against the DDG result title.
-        score = title_similarity(compare_to, rt)
+        score = title_similarity(compare_to, rt, contained_guard=_cmp_is_title)
         # Verbatim presence in the reference is corroborating evidence
         # the snippet didn't accidentally win the similarity match.
         if rt.lower() in ref_string.lower() and len(rt) > 12:
@@ -283,7 +371,7 @@ def _web_verify(parsed_title: str, parsed_author, parsed_year, ref_string: str) 
         # the DDG snippet, which can be truncated or rewritten).
         page_title = md.get("title") or rt
         page_year = md.get("year")
-        s2 = title_similarity(compare_to, page_title)
+        s2 = title_similarity(compare_to, page_title, contained_guard=_cmp_is_title)
         if page_title.lower() in ref_string.lower() and len(page_title) > 12:
             s2 = max(s2, 92)
 
@@ -370,9 +458,11 @@ def check_single_reference(ref_data) -> Optional[dict]:
         if m:
             arxiv_id = m.group(1)
     if arxiv_id:
-        match = sources.lookup_openalex_arxiv(arxiv_id)
+        # S2 indexes arXiv natively and is the strongest source for preprints;
+        # OpenAlex is tried last because its daily credit budget is tiny.
+        match = sources.get_semantic_scholar_paper(f"ARXIV:{arxiv_id}")
         if not match:
-            match = sources.get_semantic_scholar_paper(f"ARXIV:{arxiv_id}")
+            match = sources.lookup_openalex_arxiv(arxiv_id)
         if match:
             return _verified({
                 "original_reference": ref_string,
@@ -394,13 +484,14 @@ def check_single_reference(ref_data) -> Optional[dict]:
         if not doi or doi in seen_doi:
             continue
         seen_doi.add(doi)
-        match = sources.lookup_openalex_doi(doi)
-        if not match:
-            cr = sources.lookup_crossref_doi(doi)
-            if cr:
-                match = _crossref_to_match(cr, "Verified via Crossref (DOI)")
+        # Crossref IS the DOI registration authority, so it is both the most
+        # authoritative and the only unmetered option. OpenAlex last.
+        cr = sources.lookup_crossref_doi(doi)
+        match = _crossref_to_match(cr, "Verified via Crossref (DOI)") if cr else None
         if not match:
             match = sources.get_semantic_scholar_paper(f"DOI:{doi}")
+        if not match:
+            match = sources.lookup_openalex_doi(doi)
         if match:
             return _verified({
                 "original_reference": ref_string,
@@ -409,24 +500,13 @@ def check_single_reference(ref_data) -> Optional[dict]:
             })
 
     # ===========================================================
-    # PHASE 2 — GROBID structured fields → search & verify
+    # PHASE 2 — GROBID processCitation re-parse  (local, unmetered)
     # ===========================================================
-    if g_title and len(g_title) > 5:
-        status, match, flawed = _search_and_verify(g_title, g_author, g_year)
-        if status == "VERIFIED":
-            return _verified({
-                "original_reference": ref_string,
-                "parsed_query": {"title": g_title, "source": "GROBID"},
-                "openalex_match": match,
-            })
-        # carry these forward as fallbacks if Phase 3 also fails
-        carry_status, carry_match, carry_flawed = status, match, flawed
-    else:
-        carry_status, carry_match, carry_flawed = "NOT_FOUND", None, None
+    # Moved ahead of every bibliographic search: it is a local GROBID call
+    # that costs no API budget, and it produces the best available title /
+    # author / year, which every later phase queries with.
+    carry_status, carry_match, carry_flawed = "NOT_FOUND", None, None
 
-    # ===========================================================
-    # PHASE 3 — GROBID processCitation re-parse  (replaces Ollama)
-    # ===========================================================
     parsed = grobid_client.grobid_process_citation(ref_string)
     pc_title, pc_author, pc_year = "", "", None
     if parsed:
@@ -434,10 +514,17 @@ def check_single_reference(ref_data) -> Optional[dict]:
         pc_author = parsed.get("author") or ""
         pc_year = parsed.get("year")
 
-        # If processCitation found a DOI/arXiv that the regex missed:
+        # If processCitation found a DOI/arXiv that the regex missed, resolve
+        # it Crossref -> S2 -> OpenAlex, same precedence as Phase 1.
         pc_doi = parsed.get("doi")
-        if pc_doi and pc_doi not in seen_doi:
-            match = sources.lookup_openalex_doi(normalize_doi(pc_doi))
+        if pc_doi and normalize_doi(pc_doi) not in seen_doi:
+            n_pc_doi = normalize_doi(pc_doi)
+            cr = sources.lookup_crossref_doi(n_pc_doi)
+            match = _crossref_to_match(cr, "Verified via Crossref (DOI)") if cr else None
+            if not match:
+                match = sources.get_semantic_scholar_paper(f"DOI:{n_pc_doi}")
+            if not match:
+                match = sources.lookup_openalex_doi(n_pc_doi)
             if match:
                 return _verified({
                     "original_reference": ref_string,
@@ -446,7 +533,9 @@ def check_single_reference(ref_data) -> Optional[dict]:
                 })
         pc_arxiv = parsed.get("arxiv")
         if pc_arxiv and pc_arxiv != arxiv_id:
-            match = sources.lookup_openalex_arxiv(pc_arxiv)
+            match = sources.get_semantic_scholar_paper(f"ARXIV:{pc_arxiv}")
+            if not match:
+                match = sources.lookup_openalex_arxiv(pc_arxiv)
             if match:
                 return _verified({
                     "original_reference": ref_string,
@@ -454,78 +543,73 @@ def check_single_reference(ref_data) -> Optional[dict]:
                     "openalex_match": match,
                 })
 
-        if pc_title:
-            status, match, flawed = _search_and_verify(pc_title, pc_author, pc_year)
-            if status == "VERIFIED":
-                return _verified({
-                    "original_reference": ref_string,
-                    "parsed_query": {"title": pc_title, "source": "GROBID_processCitation"},
-                    "openalex_match": match,
-                })
-            # bubble up into carry if better than what we have
-            if status == "YEAR_MISMATCH" and carry_status != "YEAR_MISMATCH":
-                carry_status, carry_match = status, match
-            elif status == "FLAWED_REFERENCE" and carry_status == "NOT_FOUND":
-                carry_status, carry_flawed = status, flawed
+    # Prefer the FULLTEXT parse over the processCitation parse.
+    #
+    # This precedence used to read `pc_title or g_title`, which was harmless
+    # only because processCitation was silently broken (see §13) and pc_title
+    # was always "". Once it started working, the isolated-string parse began
+    # overriding the fulltext parse — and it is frequently worse, because it
+    # lacks document context:
+    #
+    #   g_title: "QEMU, a Fast and Portable Dynamic Translator"
+    #   pc_title:"Fast and Portable Dynamic Translator Fabrice Bellard"
+    #   g_title: "Computer Systems: A Programmer's Perspective"
+    #   pc_title:"Computer Systems: A Programmer's Perspective 2022"
+    #
+    # It glues authors/years on and drops leading tokens. Neither parse
+    # dominates though — g_title "MIT JOS"/"MIT 6" vs pc_title
+    # "MIT 6 Operating System Engineering" goes the other way — so pc_* is
+    # kept as the fallback and as an alternate query below, rather than
+    # discarded. pc_doi / pc_arxiv are unaffected and remain a clear win.
+    best_title_for_query = g_title or pc_title
+    best_author_for_query = g_author or pc_author
+    best_year_for_query = g_year or pc_year
+
+    # The other parse, when it genuinely differs — used as an extra Crossref
+    # query (Crossref is unmetered, so this is close to free). Not sent to
+    # S2, which is throttled to 1 req/s.
+    alt_title = pc_title if (pc_title and pc_title != best_title_for_query) else ""
+    alt_author = pc_author if alt_title else ""
 
     # ===========================================================
-    # PHASE 3.5 — Crossref bibliographic-search backstop
+    # PHASE 3 — Crossref bibliographic search  (PRIMARY)
     # ===========================================================
-    best_title_for_query = pc_title or g_title
-    best_author_for_query = pc_author or g_author
-
-    # Try TWO Crossref queries: (1) GROBID-extracted title+author, and
-    # (2) the raw reference string. References frequently come out of PDFs
-    # with the author list before the title, or with a journal name where
-    # the title should be — GROBID then puts the wrong words in `title`,
-    # and query (1) misses. Query (2) treats the whole reference as a
-    # bibliographic search string, which is exactly what Crossref's
-    # `query.bibliographic` is designed for. Each candidate is scored
-    # against the raw reference and verified only if the candidate's title
-    # is contained in the raw ref or hits the similarity threshold — no
-    # new false positives.
-    cr_queries = []
-    if best_title_for_query:
-        cr_queries.append(f"{best_title_for_query} {best_author_for_query}".strip())
-    if len(ref_string) >= 30:
-        cr_queries.append(ref_string[:300])
-
-    for cr_q in cr_queries:
-        for cr in sources.search_crossref(cr_q):
-            cr_title = (cr.get("title") or [""])[0] or ""
-            if not cr_title or len(cr_title) < 8:
-                continue
-            # Score against the raw reference — the GROBID-extracted title
-            # may itself be wrong, so don't compare candidates against it.
-            # Accept the match if the candidate title appears verbatim in
-            # the reference OR similarity hits VERIFY_SCORE.
-            score = title_similarity(cr_title, ref_string)
-            title_in_ref = cr_title.lower() in ref_string.lower()
-            if title_in_ref or score >= config.VERIFY_SCORE:
-                cr_year = None
-                try:
-                    cr_year = cr.get("published", {}).get("date-parts", [[None]])[0][0]
-                except (TypeError, IndexError):
-                    pass
-                match = {
-                    "display_name": cr_title,
-                    "publication_year": cr_year,
-                    "id": cr.get("URL", "No URL"),
-                    "note": "Verified via Crossref (Backstop)",
-                }
-                return _verified({
-                    "original_reference": ref_string,
-                    "parsed_query": {"title": best_title_for_query or "(raw)", "source": "CROSSREF"},
-                    "openalex_match": match,
-                })
+    # Crossref leads because it is the only backend without a hard daily
+    # cap: OpenAlex allows ~100 credits/day and S2 is throttled to 1 req/s,
+    # neither of which survives a thousand-PDF day. Crossref also emits the
+    # YEAR_MISMATCH / FLAWED_REFERENCE verdicts now, so demoting OpenAlex
+    # no longer empties those buckets.
+    status, match, flawed = _crossref_search_and_verify(
+        best_title_for_query, best_author_for_query, best_year_for_query,
+        ref_string, alt_title, alt_author
+    )
+    if status == "VERIFIED":
+        return _verified({
+            "original_reference": ref_string,
+            "parsed_query": {
+                "title": best_title_for_query or "(raw)",
+                "source": "CROSSREF",
+            },
+            "openalex_match": match,
+        })
+    if status == "YEAR_MISMATCH":
+        carry_status, carry_match = status, match
+    elif status == "FLAWED_REFERENCE":
+        carry_status, carry_flawed = status, flawed
 
     # ===========================================================
     # PHASE 4 — Semantic Scholar search backstop
     # ===========================================================
-    # Same two-query approach as Phase 3.5: try title+author first, then
-    # the raw reference. S2's search is forgiving of free-form bibliographic
+    # Same two-query approach as Phase 3: try title+author first, then the
+    # raw reference. S2's search is forgiving of free-form bibliographic
     # input so the raw-string query frequently hits where structured search
     # misses.
+    #
+    # NOTE ON SCALE: search_semantic_scholar() goes through _s2_throttle(),
+    # a global 1 req/s serial gate. These two queries are therefore the
+    # slowest thing in the pipeline. They only run for references Crossref
+    # already failed on, which is what keeps that affordable — do not
+    # promote S2 above Crossref.
     s2_queries = []
     if best_title_for_query:
         q1 = f"{best_title_for_query} {best_author_for_query}".strip()
@@ -541,7 +625,7 @@ def check_single_reference(ref_data) -> Optional[dict]:
         s2_title = s2_match.get("display_name", "") or ""
         if not s2_title or len(s2_title) < 8:
             continue
-        score = title_similarity(s2_title, ref_string)
+        score = title_similarity(s2_title, ref_string, contained_guard=False)
         title_in_ref = s2_title.lower() in ref_string.lower()
         if title_in_ref or score >= config.VERIFY_SCORE:
             return _verified({
@@ -551,7 +635,35 @@ def check_single_reference(ref_data) -> Optional[dict]:
             })
 
     # ===========================================================
-    # PHASE 4.25 — OpenAlex general-search backstop with raw reference
+    # PHASE 5 — OpenAlex structured search  (OPPORTUNISTIC BACKUP)
+    # ===========================================================
+    # Was Phase 2/3, i.e. the primary backend. Demoted here because the
+    # OpenAlex credit model allows only ~100 requests/day, and this function
+    # issues up to four calls per invocation. When the budget is spent,
+    # search_openalex() short-circuits on the _openalex_budget_exhausted
+    # latch and this phase costs nothing, so it is safe to leave enabled:
+    # on a small run it still adds matches, on a large run it self-disables
+    # after the first 429.
+    for _oa_title, _oa_author, _oa_year, _oa_src in (
+        (pc_title, pc_author, pc_year, "GROBID_processCitation"),
+        (g_title, g_author, g_year, "GROBID"),
+    ):
+        if not _oa_title or len(_oa_title) <= 5:
+            continue
+        status, match, flawed = _search_and_verify(_oa_title, _oa_author, _oa_year)
+        if status == "VERIFIED":
+            return _verified({
+                "original_reference": ref_string,
+                "parsed_query": {"title": _oa_title, "source": _oa_src},
+                "openalex_match": match,
+            })
+        if status == "YEAR_MISMATCH" and carry_status != "YEAR_MISMATCH":
+            carry_status, carry_match = status, match
+        elif status == "FLAWED_REFERENCE" and carry_status == "NOT_FOUND":
+            carry_status, carry_flawed = status, flawed
+
+    # ===========================================================
+    # PHASE 5.25 — OpenAlex general-search backstop with raw reference
     # ===========================================================
     # Always run, regardless of whether GROBID extracted a title in earlier
     # phases. The reason: when references are formatted as "[authors]
@@ -572,7 +684,7 @@ def check_single_reference(ref_data) -> Optional[dict]:
             cand_title = cand.get("display_name", "") or ""
             if not cand_title or len(cand_title) < 8:
                 continue
-            score = title_similarity(cand_title, ref_string)
+            score = title_similarity(cand_title, ref_string, contained_guard=False)
             title_in_ref = cand_title.lower() in ref_string.lower()
             if title_in_ref or score >= config.VERIFY_SCORE:
                 return _verified({
@@ -582,7 +694,7 @@ def check_single_reference(ref_data) -> Optional[dict]:
                 })
 
     # ===========================================================
-    # PHASE 4.5 — Ollama fallback (only if explicitly enabled)
+    # PHASE 5.5 — Ollama fallback (only if explicitly enabled)
     # ===========================================================
     if config.USE_OLLAMA_FALLBACK and not best_title_for_query:
         parsed_ollama = _ollama_parse(ref_string)
@@ -599,7 +711,7 @@ def check_single_reference(ref_data) -> Optional[dict]:
                 })
 
     # ===========================================================
-    # PHASE 4.9 — Web search + page-metadata backstop
+    # PHASE 5.9 — Web search + page-metadata backstop
     # ===========================================================
     # Final attempt before bucketing as NOT_FOUND / NOT_REFERENCE. Catches
     # references that legitimately exist but live outside academic DBs:
@@ -628,7 +740,7 @@ def check_single_reference(ref_data) -> Optional[dict]:
         carry_flawed = web_match
 
     # ===========================================================
-    # PHASE 5 — terminal: report carry status, NOT_FOUND, or NOT_REFERENCE
+    # PHASE 6 — terminal: report carry status, NOT_FOUND, or NOT_REFERENCE
     # ===========================================================
 
     if carry_status == "YEAR_MISMATCH" and carry_match:
