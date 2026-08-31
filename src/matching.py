@@ -195,8 +195,28 @@ def author_stripped_variants(title: str, max_variants: int = 4) -> list:
 
     Measured on run9: 28% of unresolved references have a title of this shape.
 
-    This deliberately returns SEVERAL candidates rather than committing to
-    one cut, because the boundary is genuinely ambiguous — a title-cased
+    *** NOT CURRENTLY WIRED INTO THE PIPELINE. ***
+
+    It was, briefly, as PHASE 5.83 in run10, and it must not be re-enabled in
+    that form. Measured: of 6 references it verified, FOUR were the wrong
+    work. The de-authored queries retrieve short fragment records, and tier-1
+    acceptance ("candidate title appears verbatim in the reference") is
+    trivially satisfied by a fragment:
+
+        "Irene Lee ... YouthAI Curriculum for Neural Networks" -> "Neural Networks"
+        "... What We Know About Gen Z So Far | Pew Research Center" -> "Pew Research Center"
+        "Computer Science Framework Steering Committee" -> "Steering Committee"
+
+    "Queries only" was NOT sufficient protection: the query shape determines
+    which candidates you see, and these queries surface exactly the records
+    the weak acceptance rule cannot reject. If this is revived, it needs
+    author corroboration like _grey_accept(), and it needs measuring first.
+
+    Kept because the heuristic itself works (8/9 on its test battery) and the
+    28%-of-unresolved-references finding is real.
+
+    Returns SEVERAL candidates rather than committing to one cut, because the
+    boundary is genuinely ambiguous — a title-cased
     title like "What We Know About Gen Z So Far" is indistinguishable from a
     name run by capitalisation alone. Callers use these as extra QUERIES, so
     a wrong cut costs a wasted lookup, never a wrong match.

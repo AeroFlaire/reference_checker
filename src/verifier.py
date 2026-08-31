@@ -30,7 +30,6 @@ import grobid_client
 from matching import (
     title_similarity,
     is_substantial_title,
-    author_stripped_variants,
     normalize_text,
     normalize_doi,
     repair_doi_with_linebreaks,
@@ -899,39 +898,6 @@ def check_single_reference(ref_data) -> Optional[dict]:
                 if (score >= config.FLAWED_SCORE
                         and carry_status not in ("YEAR_MISMATCH", "FLAWED_REFERENCE")):
                     carry_status, carry_flawed = "FLAWED_REFERENCE", match
-
-    # ===========================================================
-    # PHASE 5.83 — Retry with author names stripped off the title
-    # ===========================================================
-    # GROBID mis-segments messy references and leaves the author list inside
-    # the title; measured on run9, 28% of unresolved references look like
-    # this. The earlier Crossref phase queried with that polluted title and
-    # retrieved the wrong thing (or nothing).
-    #
-    # Runs LATE and only for references still unresolved, so the extra
-    # queries cost nothing on the ~90% that already matched. The variants are
-    # QUERIES only — acceptance still runs against the untouched parse and
-    # the raw reference, so a bad cut wastes a lookup and cannot mis-verify.
-    _variants = []
-    for _t in (best_title_for_query, pc_title):
-        for _v in author_stripped_variants(_t or ""):
-            if _v not in _variants:
-                _variants.append(_v)
-    if _variants:
-        status, match, flawed = _crossref_search_and_verify(
-            best_title_for_query, best_author_for_query, best_year_for_query,
-            ref_string, clean_titles=_variants,
-        )
-        if status == "VERIFIED":
-            return _verified({
-                "original_reference": ref_string,
-                "parsed_query": {"title": _variants[0], "source": "CROSSREF_DEAUTHORED"},
-                "openalex_match": match,
-            })
-        if status == "YEAR_MISMATCH" and carry_status != "YEAR_MISMATCH":
-            carry_status, carry_match = status, match
-        elif status == "FLAWED_REFERENCE" and carry_status == "NOT_FOUND":
-            carry_status, carry_flawed = status, flawed
 
     # ===========================================================
     # PHASE 5.85 — Grey-literature databases (OpenLibrary, ERIC)
