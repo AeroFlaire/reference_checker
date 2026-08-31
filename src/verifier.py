@@ -403,6 +403,7 @@ def check_single_reference(ref_data) -> Optional[dict]:
     if isinstance(ref_data, str):
         ref_string = ref_data
         g_title, g_author, g_year, g_doi, g_arxiv = "", "", None, None, None
+        g_url = None
         is_suspicious = False
     else:
         ref_string = ref_data.get("raw_text", "")
@@ -411,6 +412,7 @@ def check_single_reference(ref_data) -> Optional[dict]:
         g_year = ref_data.get("grobid_year")
         g_doi = ref_data.get("grobid_doi")
         g_arxiv = ref_data.get("grobid_arxiv")
+        g_url = ref_data.get("grobid_url")
         is_suspicious = ref_data.get("is_suspicious", False)
 
     # Normalise: strip braces, kill known header pollution, collapse whitespace.
@@ -709,6 +711,65 @@ def check_single_reference(ref_data) -> Optional[dict]:
                     "parsed_query": {"title": o_title, "source": "OLLAMA"},
                     "openalex_match": match,
                 })
+
+    # ===========================================================
+    # PHASE 5.8 — Cited URL, fetched directly
+    # ===========================================================
+    # The reference's own URL, harvested from GROBID's <ptr target="...">.
+    # This runs before the web SEARCH because it needs no search engine: we
+    # already know exactly which page the author cited, so we just fetch it
+    # and check that it describes the cited work.
+    #
+    # This is the only viable path for the grey literature that dominates
+    # not_found — software projects, datasets, standards, industry reports —
+    # none of which any academic database indexes. For those, the cited page
+    # is a MORE authoritative source than Crossref would be.
+    #
+    # arXiv and doi.org links never reach here: grobid_client folds them into
+    # grobid_arxiv / grobid_doi so Phase 1 resolves them as exact IDs.
+    if g_url:
+        md = sources.fetch_url_metadata(g_url)
+        if md:
+            # Strongest signal: the page declares its own DOI. Resolve it
+            # against the academic DBs — a registered DOI is hard to fake.
+            md_doi = normalize_doi(md.get("doi") or "")
+            if md_doi and md_doi not in seen_doi:
+                cr = sources.lookup_crossref_doi(md_doi)
+                hit = _crossref_to_match(cr, "Verified via DOI from cited URL") if cr else None
+                if not hit:
+                    hit = sources.get_semantic_scholar_paper(f"DOI:{md_doi}")
+                if hit:
+                    return _verified({
+                        "original_reference": ref_string,
+                        "parsed_query": {"doi": md_doi, "source": "CITED_URL_DOI"},
+                        "openalex_match": hit,
+                    })
+
+            page_title = (md.get("title") or "").strip()
+            if len(page_title) >= 8:
+                compare_to = (best_title_for_query
+                              if best_title_for_query and len(best_title_for_query) > 8
+                              else ref_string)
+                guard = bool(best_title_for_query and len(best_title_for_query) > 8)
+                score = title_similarity(compare_to, page_title, contained_guard=guard)
+                if page_title.lower() in ref_string.lower() and len(page_title) > 12:
+                    score = max(score, 92)
+                match = _make_web_match(
+                    {"url": g_url}, page_title, md.get("year"),
+                    "Verified via the URL cited in the reference",
+                )
+                if score >= config.VERIFY_SCORE:
+                    return _verified({
+                        "original_reference": ref_string,
+                        "parsed_query": {
+                            "title": best_title_for_query or "(raw)",
+                            "source": "CITED_URL",
+                        },
+                        "openalex_match": match,
+                    })
+                if (score >= config.FLAWED_SCORE
+                        and carry_status not in ("YEAR_MISMATCH", "FLAWED_REFERENCE")):
+                    carry_status, carry_flawed = "FLAWED_REFERENCE", match
 
     # ===========================================================
     # PHASE 5.9 — Web search + page-metadata backstop

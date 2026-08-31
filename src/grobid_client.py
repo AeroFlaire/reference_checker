@@ -225,6 +225,24 @@ def _first_text(node, xpath_expr: str) -> str:
     return ""
 
 
+_ARXIV_NEW = re.compile(r"(\d{4}\.\d{4,5})")
+_ARXIV_OLD = re.compile(r"([a-z-]+(?:\.[A-Z]{2})?/\d{7})")
+
+
+def _normalize_arxiv_id(raw: str) -> str:
+    """Reduce a GROBID arXiv idno to the bare, resolvable identifier.
+
+    GROBID emits things like "arXiv:2408.05534[cs.SE]" or
+    "arXiv:1810.04805v2". Callers build "10.48550/arXiv.<id>" DOIs and
+    "ARXIV:<id>" S2 ids from this, so anything past the number makes the
+    lookup malformed — silently, because a bad id just returns no match.
+    """
+    if not raw:
+        return ""
+    m = _ARXIV_NEW.search(raw) or _ARXIV_OLD.search(raw)
+    return m.group(1) if m else ""
+
+
 def _extract_biblstruct(node) -> dict:
     """Pull the structured fields we care about out of a TEI biblStruct.
 
@@ -255,9 +273,32 @@ def _extract_biblstruct(node) -> dict:
     # "ARXIV:<id>" S2 ids from this, so the prefix has to come off or every
     # lookup is malformed. Harmless before the namespace fix, because this
     # field was always empty.
-    arxiv = _first_text(node, ".//tei:idno[@type='arXiv']/text()")
-    if arxiv:
-        arxiv = re.sub(r"(?i)^\s*arxiv[:\s.]*", "", arxiv).strip()
+    arxiv = _normalize_arxiv_id(_first_text(node, ".//tei:idno[@type='arXiv']/text()"))
+
+    # The reference URL lives in <ptr target="..."> — an XML ATTRIBUTE, not a
+    # text node, so every text-based extraction here missed it. Measured
+    # consequence: 1 surviving URL across 4,207 references, while 1,740 kept
+    # their DOI. That matters because the not_found bucket is dominated by
+    # grey literature (software, datasets, standards, industry reports) that
+    # no academic database indexes — for those the URL is the only
+    # verification path there is.
+    url = ""
+    for xp in (".//tei:ptr/@target", ".//tei:idno[@type='url']/text()"):
+        hits = node.xpath(xp, namespaces=TEI_NS)
+        if hits:
+            url = str(hits[0]).strip()
+            break
+
+    # An arXiv or doi.org link is worth more as an ID than as a URL: it feeds
+    # the Phase 1 exact lookups instead of a page fetch.
+    if url and not arxiv:
+        m = re.search(r"arxiv\.org/(?:abs|pdf)/(\d{4}\.\d{4,5})", url, re.I)
+        if m:
+            arxiv = m.group(1)
+    if url and not doi:
+        m = re.search(r"doi\.org/(10\.\d{4,9}/[^\s?#]+)", url, re.I)
+        if m:
+            doi = m.group(1)
 
     return {
         "title": title,
@@ -265,6 +306,7 @@ def _extract_biblstruct(node) -> dict:
         "year": year or None,
         "doi": doi or None,
         "arxiv": arxiv or None,
+        "url": url or None,
     }
 
 
@@ -384,6 +426,7 @@ def extract_references(pdf_path: str) -> list:
             "grobid_year": fields["year"],
             "grobid_doi": fields["doi"],
             "grobid_arxiv": fields["arxiv"],
+            "grobid_url": fields.get("url"),
             "is_suspicious": is_suspicious,
         })
 
