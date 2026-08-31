@@ -461,6 +461,222 @@ def search_semantic_scholar(query: str) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Grey-literature databases: OpenLibrary (books) and ERIC (education)
+#
+# Reached only for references every academic backend already failed on, so
+# volume is low. Neither returns a DOI, so the verifier gates them on author
+# AND year corroboration on top of the usual title match — see
+# verifier._grey_accept(). They cannot make a reference less verified; the
+# only risk they carry is asserting a wrong work, hence the strict gate.
+# ---------------------------------------------------------------------------
+
+_GREY_MAX_RETRIES = 3
+
+
+def _grey_get(url: str, params: dict) -> Optional[requests.Response]:
+    """GET with bounded retry on 429 / 5xx, same discipline as Crossref."""
+    for attempt in range(_GREY_MAX_RETRIES):
+        try:
+            resp = requests.get(url, params=params, headers=_HEADERS, timeout=20)
+        except requests.exceptions.RequestException:
+            return None
+        if resp.status_code < 500 and resp.status_code != 429:
+            return resp
+        time.sleep(min(0.5 * (2 ** attempt) + random.uniform(0, 0.4), 8.0))
+    return None
+
+
+def search_openlibrary_title(title: str) -> list:
+    """Title search against OpenLibrary. Books are a real slice of the
+    not_found bucket and are largely absent from Crossref.
+
+    Returns the standard match shape plus an `authors` list, which the
+    verifier requires for corroboration.
+    """
+    if not title or len(title) < 8:
+        return []
+    cache_query = {"endpoint": "openlibrary.title", "q": title[:200]}
+
+    def _fetch():
+        resp = _grey_get(
+            "https://openlibrary.org/search.json",
+            {"title": title[:200], "limit": 5,
+             "fields": "title,author_name,first_publish_year,key"},
+        )
+        if resp is None or resp.status_code != 200:
+            return None
+        try:
+            docs = resp.json().get("docs", []) or []
+        except ValueError:
+            return None
+        out = []
+        for d in docs:
+            t = (d.get("title") or "").strip()
+            if not t:
+                continue
+            out.append({
+                "display_name": t,
+                "publication_year": d.get("first_publish_year"),
+                "id": "https://openlibrary.org" + (d.get("key") or ""),
+                "authors": d.get("author_name") or [],
+                "note": "Verified via OpenLibrary",
+            })
+        return out or None
+
+    return get_cache().get_or_set("openlibrary_title", cache_query, _fetch) or []
+
+
+def search_eric(title: str) -> list:
+    """Search ERIC, the US Dept. of Education's literature index.
+
+    Covers curriculum documents, technical reports and conference papers that
+    Crossref does not. Roughly a third of this corpus's unresolved references
+    are education-domain, which is why it earns a phase.
+    """
+    if not title or len(title) < 8:
+        return []
+    cache_query = {"endpoint": "eric.search", "q": title[:200]}
+
+    def _fetch():
+        resp = _grey_get(
+            "https://api.ies.ed.gov/eric/",
+            {"search": title[:200], "format": "json", "rows": 5,
+             "fields": "title,author,publicationdateyear,source"},
+        )
+        if resp is None or resp.status_code != 200:
+            return None
+        try:
+            docs = resp.json().get("response", {}).get("docs", []) or []
+        except ValueError:
+            return None
+        out = []
+        for d in docs:
+            t = (d.get("title") or "").strip()
+            if not t:
+                continue
+            authors = d.get("author") or []
+            if isinstance(authors, str):
+                authors = [authors]
+            out.append({
+                "display_name": t,
+                "publication_year": d.get("publicationdateyear"),
+                "id": d.get("source") or "https://eric.ed.gov/",
+                "authors": authors,
+                "note": "Verified via ERIC",
+            })
+        return out or None
+
+    return get_cache().get_or_set("eric_search", cache_query, _fetch) or []
+
+
+_wayback_unreachable = False
+
+
+def fetch_wayback_metadata(url: str, year=None) -> Optional[dict]:
+    """Find an archived snapshot of `url` and read its page metadata.
+
+    Returns {"title","doi","author","year","snapshot_url","timestamp"} or None.
+
+    NOTE ON REACHABILITY: the availability API lives on archive.org and the
+    snapshots live on web.archive.org, and those are separately routable.
+    Measured in this deployment: archive.org answers in ~1s while every
+    connection to web.archive.org times out (DNS resolves; the connect
+    hangs) — a network-level block on the host side.
+
+    That combination is a performance trap: the lookup succeeds, so we would
+    then burn a full connect timeout per dead URL, hundreds of times a run.
+    So the first connection failure latches web.archive.org off for the rest
+    of the process, exactly like the OpenAlex budget latch.
+    """
+    global _wayback_unreachable
+    if _wayback_unreachable:
+        return None
+    snap = lookup_wayback(url, year)
+    if not snap:
+        return None
+    try:
+        probe = requests.head(snap["url"], timeout=(4, 8), allow_redirects=True)
+        if probe.status_code >= 400 and probe.status_code != 405:
+            return None
+    except requests.exceptions.RequestException:
+        if not _wayback_unreachable:
+            print("  !! web.archive.org unreachable; skipping snapshot lookups "
+                  "for the rest of this run (availability API still works).")
+        _wayback_unreachable = True
+        return None
+    md = fetch_url_metadata(snap["url"])
+    if not md:
+        return None
+    out = dict(md)
+    out["snapshot_url"] = snap["url"]
+    out["timestamp"] = snap.get("timestamp", "")
+    return out
+
+
+def lookup_wayback(url: str, year=None) -> Optional[dict]:
+    """Find an Internet Archive snapshot of an exact URL.
+
+    Link rot is the normal failure mode for the grey literature that
+    dominates not_found — software pages, org reports, curriculum documents.
+    The cited-URL phase gives up when the live page is gone; the archive
+    usually still has it.
+
+    Keyed on the EXACT URL the author cited, so this introduces no matching
+    risk whatsoever: either the archive holds that page or it does not. When
+    the reference carries a year we ask for the snapshot nearest to it, which
+    gets the version the author actually saw rather than today's redirect to
+    a parked domain.
+
+    Returns {"url", "timestamp"} or None.
+    """
+    if not url or not url.lower().startswith(("http://", "https://")):
+        return None
+    ts = ""
+    try:
+        if year and 1990 <= int(str(year)[:4]) <= 2100:
+            ts = f"{int(str(year)[:4])}0601"
+    except (TypeError, ValueError):
+        ts = ""
+
+    cache_query = {"endpoint": "wayback.available", "url": url[:400], "ts": ts}
+
+    def _query(with_ts: bool):
+        params = {"url": url}
+        if with_ts and ts:
+            params["timestamp"] = ts
+        resp = _grey_get("https://archive.org/wayback/available", params)
+        if resp is None or resp.status_code != 200:
+            return None
+        try:
+            snap = ((resp.json().get("archived_snapshots") or {}).get("closest") or {})
+        except ValueError:
+            return None
+        if not snap.get("available") or not snap.get("url"):
+            return None
+        # The availability API hands back http:// URLs. Plain HTTP to
+        # web.archive.org fails outright from inside the container, so the
+        # snapshot must be upgraded or every fetch of it dies with a
+        # ConnectionError.
+        snap_url = re.sub(r"^http://", "https://", snap["url"])
+        return {"url": snap_url, "timestamp": snap.get("timestamp", "")}
+
+    def _fetch():
+        # Ask for a snapshot near the reference year first. The API does NOT
+        # reliably fall back to the nearest available one: geocities.com with
+        # timestamp=20050601 reports nothing, while the same URL with no
+        # timestamp returns a 2019 capture. So retry unpinned rather than
+        # concluding the page was never archived.
+        if ts:
+            hit = _query(True)
+            if hit:
+                return hit
+        return _query(False)
+
+    res = get_cache().get_or_set("wayback", cache_query, _fetch)
+    return res if isinstance(res, dict) and res.get("url") else None
+
+
+# ---------------------------------------------------------------------------
 # WG21 (C++ standards papers)
 # ---------------------------------------------------------------------------
 

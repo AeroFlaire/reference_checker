@@ -29,6 +29,8 @@ import sources
 import grobid_client
 from matching import (
     title_similarity,
+    is_substantial_title,
+    author_stripped_variants,
     normalize_text,
     normalize_doi,
     repair_doi_with_linebreaks,
@@ -152,7 +154,7 @@ def _search_and_verify(parsed_title: str, parsed_author: str, parsed_year) -> tu
 
 def _crossref_search_and_verify(parsed_title: str, parsed_author, parsed_year,
                                 ref_string: str, alt_title: str = "",
-                                alt_author="") -> tuple:
+                                alt_author="", clean_titles=()) -> tuple:
     """Crossref equivalent of _search_and_verify. Returns the same
     (status, best_match, best_flawed) contract.
 
@@ -191,6 +193,19 @@ def _crossref_search_and_verify(parsed_title: str, parsed_author, parsed_year,
         if isinstance(alt_a, list):
             alt_a = alt_a[0] if alt_a else ""
         queries.append(f"{alt_title} {alt_a}".strip())
+    # Author/publisher/year-stripped variants of the titles above. These only
+    # differ when GROBID mis-segmented the reference, so on a clean parse
+    # they dedupe away and cost nothing. When they DO differ they change
+    # which candidate Crossref returns at rank 1, which is the whole point:
+    # a polluted query returns a near-miss that then fails acceptance.
+    author_str0 = parsed_author or ""
+    if isinstance(author_str0, list):
+        author_str0 = author_str0[0] if author_str0 else ""
+    for ct in clean_titles:
+        if ct and ct not in (parsed_title, alt_title):
+            queries.append(f"{ct} {author_str0}".strip())
+            queries.append(ct)
+
     if len(ref_string) >= 30:
         queries.append(ref_string[:300])
     if not queries:
@@ -211,11 +226,22 @@ def _crossref_search_and_verify(parsed_title: str, parsed_author, parsed_year,
             # Tier 1 — score against the raw reference (proven run4 logic).
             # ref_string is a raw reference, not a title -> guard off
             raw_score = title_similarity(cand_title, ref_string, contained_guard=False)
-            if cand_title.lower() in ref_string.lower() or raw_score >= config.VERIFY_SCORE:
+            # Verbatim containment only counts for a title specific enough to
+            # mean something. "Introduction" appears inside "An Introduction
+            # to Python" and Crossref really does hold a record titled just
+            # "Introduction".
+            verbatim_ok = (cand_title.lower() in ref_string.lower()
+                           and is_substantial_title(cand_title))
+            if verbatim_ok or raw_score >= config.VERIFY_SCORE:
                 return "VERIFIED", cand, None
 
             # Tier 2 — score against the parsed title so Crossref can also
             # emit the triage verdicts.
+            # NOTE: clean_titles are deliberately NOT scoring targets. The
+            # cleaner can over-strip, and a truncated title is easier to
+            # match, which would risk asserting a wrong work as verified.
+            # They improve which candidates we RETRIEVE; acceptance still
+            # runs against the untouched parse and the raw reference.
             title_options = [t for t in (parsed_title, alt_title) if t]
             if not title_options:
                 continue
@@ -235,6 +261,88 @@ def _crossref_search_and_verify(parsed_title: str, parsed_author, parsed_year,
                 status, best_flawed = "FLAWED_REFERENCE", scored
 
     return status, best_match, best_flawed
+
+
+
+# Tokens that must never, on their own, corroborate an author. Name particles
+# and corporate words: a "Council"/"Association"/"Research" author matches far
+# too many references by chance. Measured: candidate author ["The Council"]
+# corroborated against "Council Recommendation of 22 May 2018 ...", which is
+# precisely the wrong-work assertion this gate exists to prevent.
+_AUTHOR_STOP = {
+    "the", "and", "for", "with", "van", "von", "der", "den", "del", "dos",
+    "inc", "ltd", "llc", "plc", "corp",
+    "council", "association", "committee", "department", "ministry", "agency",
+    "commission", "bureau", "institute", "foundation", "university", "college",
+    "school", "society", "center", "centre", "group", "board", "office",
+    "national", "international", "american", "european", "federal", "state",
+    "research", "computing", "education", "educational", "technology",
+    "science", "sciences", "standards", "press", "publishing", "publishers",
+    "project", "program", "programme", "team", "staff", "contributors",
+}
+
+
+def _author_corroborated(cand_authors, ref_string: str) -> bool:
+    """Does at least one of the candidate's authors appear in the reference?
+
+    REQUIRED for OpenLibrary and ERIC, which return no DOI. A title match
+    alone is the weakest evidence we accept anywhere, and these are books and
+    reports with short, reusable titles — exactly where a wrong work is
+    easiest to assert. Demanding an author surname turns one signal into two.
+
+    Prefers the surname (the part before the comma in "Crocker, Linda"), and
+    ignores initials and corporate filler.
+    """
+    if not cand_authors:
+        return False
+    ref = normalize_text(ref_string)
+    ref_words = set(ref.split())
+    for a in cand_authors:
+        a = str(a or "")
+        surname_part = a.split(",")[0] if "," in a else a
+        for tok in normalize_text(surname_part).split():
+            if len(tok) > 2 and tok not in _AUTHOR_STOP and tok in ref_words:
+                return True
+    return False
+
+
+def _grey_accept(cand: dict, ref_string: str, parsed_title: str, parsed_year):
+    """Acceptance gate for OpenLibrary / ERIC candidates.
+
+    Returns ("VERIFIED"|"FLAWED_REFERENCE"|None, match_dict).
+
+    Deliberately stricter than any other phase, because these carry no DOI:
+      1. the candidate title must be substantial (>= 2 content tokens);
+      2. it must match the reference strongly (verbatim, or >= VERIFY_SCORE);
+      3. an author must corroborate  <- the one that does the real work;
+      4. if both years are known and differ by more than 3, the result is
+         downgraded to FLAWED_REFERENCE rather than asserted as verified.
+    """
+    title = (cand.get("display_name") or "").strip()
+    if not is_substantial_title(title):
+        return None, None
+
+    strong = (title.lower() in ref_string.lower()
+              or title_similarity(title, ref_string, contained_guard=False) >= config.VERIFY_SCORE
+              or (parsed_title and title_similarity(parsed_title, title) >= config.VERIFY_SCORE))
+    if not strong:
+        return None, None
+
+    if not _author_corroborated(cand.get("authors"), ref_string):
+        return None, None
+
+    match = {
+        "display_name": title,
+        "publication_year": cand.get("publication_year"),
+        "id": cand.get("id") or "",
+        "note": cand.get("note") or "",
+    }
+
+    py, fy = _safe_int(parsed_year), _safe_int(cand.get("publication_year"))
+    if py and fy and abs(py - fy) > 3:
+        match["note"] = f"Edition mismatch (Ref: {py}, Found: {fy})"
+        return "FLAWED_REFERENCE", match
+    return "VERIFIED", match
 
 
 # ----- optional Ollama fallback (only used if explicitly enabled) -----------
@@ -332,7 +440,7 @@ def _web_verify(parsed_title: str, parsed_author, parsed_year, ref_string: str) 
         score = title_similarity(compare_to, rt, contained_guard=_cmp_is_title)
         # Verbatim presence in the reference is corroborating evidence
         # the snippet didn't accidentally win the similarity match.
-        if rt.lower() in ref_string.lower() and len(rt) > 12:
+        if rt.lower() in ref_string.lower() and len(rt) > 12 and is_substantial_title(rt):
             score = max(score, 92)
 
         if score >= config.VERIFY_SCORE:
@@ -404,6 +512,7 @@ def check_single_reference(ref_data) -> Optional[dict]:
         ref_string = ref_data
         g_title, g_author, g_year, g_doi, g_arxiv = "", "", None, None, None
         g_url = None
+        g_title_clean = ""
         is_suspicious = False
     else:
         ref_string = ref_data.get("raw_text", "")
@@ -413,6 +522,7 @@ def check_single_reference(ref_data) -> Optional[dict]:
         g_doi = ref_data.get("grobid_doi")
         g_arxiv = ref_data.get("grobid_arxiv")
         g_url = ref_data.get("grobid_url")
+        g_title_clean = ref_data.get("grobid_title_clean") or ""
         is_suspicious = ref_data.get("is_suspicious", False)
 
     # Normalise: strip braces, kill known header pollution, collapse whitespace.
@@ -511,8 +621,10 @@ def check_single_reference(ref_data) -> Optional[dict]:
 
     parsed = grobid_client.grobid_process_citation(ref_string)
     pc_title, pc_author, pc_year = "", "", None
+    pc_title_clean = ""
     if parsed:
         pc_title = parsed.get("title") or ""
+        pc_title_clean = parsed.get("title_clean") or ""
         pc_author = parsed.get("author") or ""
         pc_year = parsed.get("year")
 
@@ -583,7 +695,8 @@ def check_single_reference(ref_data) -> Optional[dict]:
     # no longer empties those buckets.
     status, match, flawed = _crossref_search_and_verify(
         best_title_for_query, best_author_for_query, best_year_for_query,
-        ref_string, alt_title, alt_author
+        ref_string, alt_title, alt_author,
+        clean_titles=[t for t in (g_title_clean, pc_title_clean) if t],
     )
     if status == "VERIFIED":
         return _verified({
@@ -628,7 +741,8 @@ def check_single_reference(ref_data) -> Optional[dict]:
         if not s2_title or len(s2_title) < 8:
             continue
         score = title_similarity(s2_title, ref_string, contained_guard=False)
-        title_in_ref = s2_title.lower() in ref_string.lower()
+        title_in_ref = (s2_title.lower() in ref_string.lower()
+                        and is_substantial_title(s2_title))
         if title_in_ref or score >= config.VERIFY_SCORE:
             return _verified({
                 "original_reference": ref_string,
@@ -687,7 +801,8 @@ def check_single_reference(ref_data) -> Optional[dict]:
             if not cand_title or len(cand_title) < 8:
                 continue
             score = title_similarity(cand_title, ref_string, contained_guard=False)
-            title_in_ref = cand_title.lower() in ref_string.lower()
+            title_in_ref = (cand_title.lower() in ref_string.lower()
+                            and is_substantial_title(cand_title))
             if title_in_ref or score >= config.VERIFY_SCORE:
                 return _verified({
                     "original_reference": ref_string,
@@ -729,13 +844,27 @@ def check_single_reference(ref_data) -> Optional[dict]:
     # grobid_arxiv / grobid_doi so Phase 1 resolves them as exact IDs.
     if g_url:
         md = sources.fetch_url_metadata(g_url)
+        _url_note = "Verified via the URL cited in the reference"
+        _shown_url = g_url
+        if not md:
+            # Link rot. The archive is keyed on the exact cited URL, so this
+            # adds coverage without adding any wrong-work risk.
+            wb = sources.fetch_wayback_metadata(g_url, best_year_for_query)
+            if wb:
+                md = wb
+                _shown_url = wb.get("snapshot_url") or g_url
+                _ts = (wb.get("timestamp") or "")[:4]
+                _url_note = (
+                    "Verified via Internet Archive snapshot of the cited URL"
+                    + (f" ({_ts})" if _ts else "")
+                )
         if md:
             # Strongest signal: the page declares its own DOI. Resolve it
             # against the academic DBs — a registered DOI is hard to fake.
             md_doi = normalize_doi(md.get("doi") or "")
             if md_doi and md_doi not in seen_doi:
                 cr = sources.lookup_crossref_doi(md_doi)
-                hit = _crossref_to_match(cr, "Verified via DOI from cited URL") if cr else None
+                hit = _crossref_to_match(cr, f"Verified via DOI from cited URL ({_shown_url[:60]})") if cr else None
                 if not hit:
                     hit = sources.get_semantic_scholar_paper(f"DOI:{md_doi}")
                 if hit:
@@ -752,11 +881,11 @@ def check_single_reference(ref_data) -> Optional[dict]:
                               else ref_string)
                 guard = bool(best_title_for_query and len(best_title_for_query) > 8)
                 score = title_similarity(compare_to, page_title, contained_guard=guard)
-                if page_title.lower() in ref_string.lower() and len(page_title) > 12:
+                if (page_title.lower() in ref_string.lower() and len(page_title) > 12
+                        and is_substantial_title(page_title)):
                     score = max(score, 92)
                 match = _make_web_match(
-                    {"url": g_url}, page_title, md.get("year"),
-                    "Verified via the URL cited in the reference",
+                    {"url": _shown_url}, page_title, md.get("year"), _url_note,
                 )
                 if score >= config.VERIFY_SCORE:
                     return _verified({
@@ -770,6 +899,67 @@ def check_single_reference(ref_data) -> Optional[dict]:
                 if (score >= config.FLAWED_SCORE
                         and carry_status not in ("YEAR_MISMATCH", "FLAWED_REFERENCE")):
                     carry_status, carry_flawed = "FLAWED_REFERENCE", match
+
+    # ===========================================================
+    # PHASE 5.83 — Retry with author names stripped off the title
+    # ===========================================================
+    # GROBID mis-segments messy references and leaves the author list inside
+    # the title; measured on run9, 28% of unresolved references look like
+    # this. The earlier Crossref phase queried with that polluted title and
+    # retrieved the wrong thing (or nothing).
+    #
+    # Runs LATE and only for references still unresolved, so the extra
+    # queries cost nothing on the ~90% that already matched. The variants are
+    # QUERIES only — acceptance still runs against the untouched parse and
+    # the raw reference, so a bad cut wastes a lookup and cannot mis-verify.
+    _variants = []
+    for _t in (best_title_for_query, pc_title):
+        for _v in author_stripped_variants(_t or ""):
+            if _v not in _variants:
+                _variants.append(_v)
+    if _variants:
+        status, match, flawed = _crossref_search_and_verify(
+            best_title_for_query, best_author_for_query, best_year_for_query,
+            ref_string, clean_titles=_variants,
+        )
+        if status == "VERIFIED":
+            return _verified({
+                "original_reference": ref_string,
+                "parsed_query": {"title": _variants[0], "source": "CROSSREF_DEAUTHORED"},
+                "openalex_match": match,
+            })
+        if status == "YEAR_MISMATCH" and carry_status != "YEAR_MISMATCH":
+            carry_status, carry_match = status, match
+        elif status == "FLAWED_REFERENCE" and carry_status == "NOT_FOUND":
+            carry_status, carry_flawed = status, flawed
+
+    # ===========================================================
+    # PHASE 5.85 — Grey-literature databases (OpenLibrary, ERIC)
+    # ===========================================================
+    # Books and education-sector literature that Crossref does not index.
+    # Runs after the cited URL (a URL is harder evidence than a title match)
+    # and before the web search. Neither source returns a DOI, so
+    # _grey_accept() additionally REQUIRES author corroboration — see there.
+    _grey_titles = [t for t in dict.fromkeys(
+        [best_title_for_query, g_title_clean, pc_title_clean, pc_title]) if t and len(t) > 8]
+    if _grey_titles:
+        for finder in (sources.search_openlibrary_title, sources.search_eric):
+            for _q in _grey_titles:
+                for cand in finder(_q):
+                    kind, match = _grey_accept(
+                        cand, ref_string, best_title_for_query, best_year_for_query)
+                    if kind == "VERIFIED":
+                        return _verified({
+                            "original_reference": ref_string,
+                            "parsed_query": {
+                                "title": best_title_for_query or "(raw)",
+                                "source": "OPENLIBRARY" if finder is sources.search_openlibrary_title else "ERIC",
+                            },
+                            "openalex_match": match,
+                        })
+                    if (kind == "FLAWED_REFERENCE"
+                            and carry_status not in ("YEAR_MISMATCH", "FLAWED_REFERENCE")):
+                        carry_status, carry_flawed = kind, match
 
     # ===========================================================
     # PHASE 5.9 — Web search + page-metadata backstop

@@ -243,6 +243,81 @@ def _normalize_arxiv_id(raw: str) -> str:
     return m.group(1) if m else ""
 
 
+_TRAILING_YEAR = re.compile(r"[\s.,;:()\[\]|-]*\b(?:19|20)\d{2}[a-z]?[\s.,;:()\[\]|-]*$")
+
+
+def _clean_title_for_query(title: str, names, publisher: str = "") -> str:
+    """Strip author names, publisher and trailing year off a parsed title.
+
+    GROBID mis-segments messy references and glues neighbouring fields into
+    the title:
+
+        "Bruce Findler Matthew Flatt Shriram Krishnamurthi How to Design Programs"
+        "Introduction to Classical and Modern Test Theory. Holt, Rinehart and Winston"
+        "Computer Systems: A Programmer's Perspective 2022"
+
+    A polluted title still *retrieves* something, but it retrieves the wrong
+    candidate: querying OpenLibrary with the first example returns "How to
+    Design Programs, Second Edition", whose extra tokens then fail the
+    acceptance check, whereas the cleaned query returns the exact title.
+
+    Only strips tokens we can CORROBORATE from other fields of the same
+    biblStruct — author surnames/forenames and the publisher — plus a
+    trailing year. It never guesses at name-shaped words, so it cannot eat a
+    real title like "Shannon's Theorem".
+
+    The result is used for QUERYING only. Scoring still uses the original
+    title, so a bad clean cannot loosen the acceptance threshold.
+    """
+    if not title:
+        return ""
+    out = title.strip()
+
+    tokens = set()
+    for n in names or []:
+        for part in re.split(r"[\s,.]+", str(n or "")):
+            part = part.strip().lower()
+            if len(part) > 1:                 # skip initials
+                tokens.add(part)
+    for part in re.split(r"[\s,.]+", str(publisher or "")):
+        part = part.strip().lower()
+        if len(part) > 2:
+            tokens.add(part)
+
+    if tokens:
+        # Peel corroborated tokens off each END only — an author name in the
+        # MIDDLE is far more likely to be part of the real title ("The Kolb
+        # Learning Style Inventory").
+        #
+        # Require a run of at least TWO consecutive corroborated tokens. A
+        # single one is usually a coincidence and stripping it destroys real
+        # titles: "ARM Instruction Set: Reference Guide" (author "Arm") and
+        # "Computing Self-Efficacy in Undergraduate Students" (org author
+        # containing "Computing") both lost their first word to the earlier
+        # one-token rule.
+        words = out.split()
+        norm = [w.strip(",.;:").lower() for w in words]
+
+        lead = 0
+        while lead < len(norm) and norm[lead] in tokens:
+            lead += 1
+        if lead < 2 or len(words) - lead < 2:
+            lead = 0
+
+        trail = 0
+        while trail < len(norm) - lead and norm[len(norm) - 1 - trail] in tokens:
+            trail += 1
+        if trail < 2 or len(words) - lead - trail < 2:
+            trail = 0
+
+        if lead or trail:
+            out = " ".join(words[lead:len(words) - trail])
+
+    out = _TRAILING_YEAR.sub("", out).strip(" .,;:-")
+    # Refuse to return something degenerate; fall back to the original.
+    return out if len(out) >= 8 else title.strip()
+
+
 def _extract_biblstruct(node) -> dict:
     """Pull the structured fields we care about out of a TEI biblStruct.
 
@@ -300,8 +375,12 @@ def _extract_biblstruct(node) -> dict:
         if m:
             doi = m.group(1)
 
+    all_names = node.xpath(".//tei:author/tei:persName//text()", namespaces=TEI_NS)
+    publisher = _first_text(node, ".//tei:publisher/text()")
+
     return {
         "title": title,
+        "title_clean": _clean_title_for_query(title, all_names, publisher),
         "author": author,
         "year": year or None,
         "doi": doi or None,
@@ -422,6 +501,7 @@ def extract_references(pdf_path: str) -> list:
         extracted.append({
             "raw_text": raw_text,
             "grobid_title": fields["title"],
+            "grobid_title_clean": fields.get("title_clean") or fields["title"],
             "grobid_author": fields["author"],
             "grobid_year": fields["year"],
             "grobid_doi": fields["doi"],

@@ -172,6 +172,115 @@ def title_similarity(parsed: str, candidate: str, contained_guard: bool = True) 
     return int(base)
 
 
+_INITIAL_RE = re.compile(r"^[A-Z]\.?$")
+_NAMEISH_RE = re.compile(r"^[A-Z][A-Za-z'’-]*[.,]?$")
+# Lowercase function words. A real title in title case still contains these
+# ("How TO Design Programs"); a run of author names never does. This is what
+# lets us find the boundary between the author list and the title.
+_TITLE_FUNCTION_WORDS = {
+    "a", "an", "the", "to", "of", "for", "in", "on", "with", "and", "or",
+    "at", "as", "by", "from", "into", "via", "vs", "versus", "through",
+    "using", "toward", "towards", "about", "over", "under", "between",
+}
+
+
+def author_stripped_variants(title: str, max_variants: int = 4) -> list:
+    """Candidate titles with a leading/trailing run of author names removed.
+
+    GROBID frequently mis-segments a messy reference and puts the author list
+    inside the title:
+
+        "Matthias Felleisen Robert Bruce Findler ... How to Design Programs"
+        "The Impact of Late Registration on College Retention Janet Carter"
+
+    Measured on run9: 28% of unresolved references have a title of this shape.
+
+    This deliberately returns SEVERAL candidates rather than committing to
+    one cut, because the boundary is genuinely ambiguous — a title-cased
+    title like "What We Know About Gen Z So Far" is indistinguishable from a
+    name run by capitalisation alone. Callers use these as extra QUERIES, so
+    a wrong cut costs a wasted lookup, never a wrong match.
+    """
+    if not title:
+        return []
+    words = title.split()
+    if len(words) < 5:
+        return []
+
+    def nameish(w):
+        return bool(_INITIAL_RE.match(w) or _NAMEISH_RE.match(w))
+
+    lead = 0
+    while lead < len(words) and nameish(words[lead]):
+        lead += 1
+    trail = 0
+    while trail < len(words) and nameish(words[len(words) - 1 - trail]):
+        trail += 1
+
+    # Only act when there is a plausibly long name run. A clean title like
+    # "Deep Residual Learning for Image Recognition" tops out at 3 before a
+    # function word breaks it, and must not be touched.
+    if max(lead, trail) < 4:
+        return []
+    # If EVERY token is capitalised there is no author/title boundary to find
+    # — it is simply a title-cased title ("Attention Is All You Need", "The
+    # Kolb Learning Style Inventory"). Cutting it only produces truncations.
+    if lead >= len(words) or trail >= len(words):
+        return []
+
+    out = []
+
+    # Several leading cuts rather than one. The boundary is ambiguous — the
+    # first capitalised word of the title looks exactly like another surname
+    # ("... Krishnamurthi How to Design Programs") — so emit the neighbours
+    # and let the search decide which one retrieves the work.
+    if lead >= 4:
+        for cut in (lead, lead - 1, lead - 2):
+            if cut >= 2 and len(words) - cut >= 3:
+                out.append(" ".join(words[cut:]))
+
+    # Trailing authors: try removing 2..5 tokens, since author lists vary in
+    # length and a maximal cut eats the subtitle ("...: A Longitudinal Study"
+    # is all capitalised too).
+    if trail >= 2:
+        for k in (2, 3, 4, 5):
+            if k <= trail and len(words) - k >= 3:
+                out.append(" ".join(words[:len(words) - k]))
+
+    seen, uniq = set(), []
+    for v in out:
+        v = v.strip(" .,;:-")
+        if len(v) >= 8 and v != title and v not in seen:
+            seen.add(v)
+            uniq.append(v)
+    return uniq[:max_variants]
+
+
+def content_token_count(title: str) -> int:
+    """Number of non-stopword tokens in a title."""
+    if not title:
+        return 0
+    return len([w for w in normalize_text(title).split() if w not in _STOPWORDS])
+
+
+def is_substantial_title(title: str, minimum: int = 2) -> bool:
+    """Is this title specific enough to justify a verbatim-containment match?
+
+    Several phases accept a candidate when its title appears verbatim inside
+    the raw reference. That is strong evidence for a real title, and useless
+    for a generic one — "Introduction" trivially appears inside "An
+    Introduction to Python", and Crossref does contain records titled exactly
+    "Introduction", "Standards", "Contributors" and "Tutorials".
+
+    Measured on run9: of 45 verifications accepted this way on a single
+    content token, roughly two-thirds were wrong works. Requiring two content
+    tokens removes them. The genuinely one-word titles that get caught
+    (SharedPhys, Hyperstyle, Gradescope) are demoted to FLAWED_REFERENCE
+    rather than dropped, so an editor still sees them.
+    """
+    return content_token_count(title) >= minimum
+
+
 def title_matches(parsed: str, candidate: str, threshold: int) -> bool:
     """Convenience wrapper for boolean checks."""
     return title_similarity(parsed, candidate) >= threshold
